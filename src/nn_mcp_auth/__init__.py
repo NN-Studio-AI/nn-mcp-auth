@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .auth import BearerAuthMiddleware
+from .auth import BearerAuthMiddleware, get_subject
 from .errors import ConfigurationError, NnMcpAuthError, ValidationError
 from .http import build_oauth_endpoints
 from .oauth import (
@@ -30,12 +30,13 @@ from .storage import (
     RefreshTokenStore,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
     # auth
     "BearerAuthMiddleware",
+    "get_subject",
     # errors
     "ConfigurationError",
     "NnMcpAuthError",
