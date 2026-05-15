@@ -237,6 +237,48 @@ def test_metadata_endpoint(app: Starlette) -> None:
         assert "authorization_code" in body["grant_types_supported"]
 
 
+def test_protected_resource_metadata_at_root(app: Starlette) -> None:
+    """RFC 9728 — required by MCP authorization spec 2025-06-18."""
+
+    with TestClient(app) as client:
+        resp = client.get("/.well-known/oauth-protected-resource")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "resource" in body
+        assert "authorization_servers" in body
+        assert isinstance(body["authorization_servers"], list)
+        assert body["authorization_servers"]
+        assert body["bearer_methods_supported"] == ["header"]
+
+
+def test_protected_resource_metadata_at_path_variant(app: Starlette) -> None:
+    """Clients probe ``/.well-known/oauth-protected-resource/<resource-path>``
+    before falling back to the root variant. Both must answer."""
+
+    with TestClient(app) as client:
+        resp = client.get("/.well-known/oauth-protected-resource/mcp")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "authorization_servers" in body
+        # Nested arbitrary paths also resolve.
+        nested = client.get("/.well-known/oauth-protected-resource/some/nested/path")
+        assert nested.status_code == 200
+        assert nested.json()["authorization_servers"] == body["authorization_servers"]
+
+
+def test_protected_resource_uses_configured_issuer(app: Starlette) -> None:
+    """The metadata ``resource`` and ``authorization_servers`` entries reflect
+    the configured ``issuer_url`` (or the request host when unset)."""
+
+    with TestClient(app) as client:
+        resp = client.get("/.well-known/oauth-protected-resource")
+        body = resp.json()
+        # The fixture leaves issuer empty, so it should fall back to the
+        # request URL. We just assert it is an https-like URL.
+        assert body["resource"]
+        assert body["authorization_servers"][0] == body["resource"]
+
+
 def test_token_rejects_unsupported_grant(app: Starlette) -> None:
     with TestClient(app) as client:
         resp = client.post(

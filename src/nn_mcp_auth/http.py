@@ -1,12 +1,18 @@
 """Starlette endpoint factory for OAuth 2.0 flows.
 
 Call :func:`build_oauth_endpoints` after building your Starlette app. It
-mounts four routes when ``settings.enabled``:
+mounts the following routes when ``settings.enabled``:
 
 - ``GET  /authorize``                                  — Authorization Code grant
 - ``POST /token``                                      — all three grant types
 - ``POST /oauth/token``                                — legacy alias for /token
 - ``GET  /.well-known/oauth-authorization-server``     — RFC 8414 metadata
+- ``GET  /.well-known/oauth-protected-resource``       — RFC 9728 metadata
+- ``GET  /.well-known/oauth-protected-resource/{path}``— RFC 9728 path variant
+
+The RFC 9728 endpoints are required by the MCP authorization spec
+(rev 2025-06-18); without them, recent Claude.ai clients loop on 401 →
+discovery → 401 and never reach ``/authorize``.
 
 If ``settings.enabled`` is ``False`` the app is returned untouched so an MCP
 can be deployed with only the static ``MCP_AUTH_TOKEN`` accepted on /mcp.
@@ -211,6 +217,39 @@ def _make_metadata_handler(
     return handler
 
 
+def _make_protected_resource_handler(
+    settings: OAuthSettings,
+) -> Callable[[Request], Awaitable[Response]]:
+    """RFC 9728 — OAuth 2.0 Protected Resource Metadata.
+
+    The MCP authorization spec (rev 2025-06-18) requires resource servers to
+    publish this metadata so clients can discover which authorization server
+    to use **before** issuing an Authorization Request. Without it, recent
+    Claude.ai clients loop on 401 → metadata discovery → 401 and never reach
+    ``/authorize``.
+
+    We expose the same payload at both ``/.well-known/oauth-protected-resource``
+    and the path-suffixed variant (e.g. ``/.well-known/oauth-protected-resource/mcp``)
+    because clients probe both before falling back.
+    """
+
+    async def handler(request: Request) -> Response:
+        if not settings.enabled:
+            return _oauth_error("invalid_client", status_code=503)
+
+        issuer = settings.issuer_url or f"{request.url.scheme}://{request.url.netloc}"
+        return JSONResponse(
+            {
+                "resource": issuer,
+                "authorization_servers": [issuer],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": [],
+            }
+        )
+
+    return handler
+
+
 def build_oauth_endpoints(
     app: Starlette,
     *,
@@ -225,6 +264,7 @@ def build_oauth_endpoints(
     authorize_handler = _make_authorize_handler(settings, stores)
     token_handler = _make_token_handler(settings, stores)
     metadata_handler = _make_metadata_handler(settings)
+    protected_resource_handler = _make_protected_resource_handler(settings)
 
     app.add_route("/authorize", authorize_handler, methods=["GET"])
     app.add_route("/token", token_handler, methods=["POST"])
@@ -233,6 +273,18 @@ def build_oauth_endpoints(
     app.add_route(
         "/.well-known/oauth-authorization-server",
         metadata_handler,
+        methods=["GET"],
+    )
+    # RFC 9728 — exposed at the well-known root AND at the path-suffixed
+    # variant the MCP authorization spec asks clients to probe.
+    app.add_route(
+        "/.well-known/oauth-protected-resource",
+        protected_resource_handler,
+        methods=["GET"],
+    )
+    app.add_route(
+        "/.well-known/oauth-protected-resource/{path:path}",
+        protected_resource_handler,
         methods=["GET"],
     )
 
