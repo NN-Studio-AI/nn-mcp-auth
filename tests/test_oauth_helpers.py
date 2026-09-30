@@ -17,6 +17,7 @@ from nn_mcp_auth.oauth import (
     parse_basic_auth,
     verify_pkce,
 )
+from nn_mcp_auth.password import hash_login_password
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -148,3 +149,62 @@ def test_load_oauth_settings_custom_redirect_uris() -> None:
 def test_is_redirect_uri_allowed_rejects_empty() -> None:
     settings = OAuthSettings(client_id="x", client_secret="y")
     assert settings.is_redirect_uri_allowed("") is False
+
+
+_BASE_ENV = {"OAUTH_CLIENT_ID": "x", "OAUTH_CLIENT_SECRET": "y"}
+
+
+def test_load_oauth_settings_login_disabled_by_default() -> None:
+    settings = load_oauth_settings(dict(_BASE_ENV))
+    assert settings.login_enabled is False
+    assert settings.login_username == ""
+    assert settings.login_password == ""
+
+
+def test_load_oauth_settings_login_enabled_plain_text() -> None:
+    settings = load_oauth_settings(
+        {**_BASE_ENV, "OAUTH_LOGIN_USERNAME": " caio ", "OAUTH_LOGIN_PASSWORD": " s3nha \n"}
+    )
+    assert settings.login_enabled is True
+    assert settings.login_username == "caio"
+    assert settings.login_password == "s3nha"
+
+
+def test_load_oauth_settings_login_enabled_with_hash() -> None:
+    hashed = hash_login_password("s3nha")
+    settings = load_oauth_settings(
+        {**_BASE_ENV, "OAUTH_LOGIN_USERNAME": "caio", "OAUTH_LOGIN_PASSWORD": hashed}
+    )
+    assert settings.login_enabled is True
+    assert settings.login_password == hashed
+
+
+@pytest.mark.parametrize(
+    ("env", "missing"),
+    [
+        ({"OAUTH_LOGIN_USERNAME": "caio"}, "OAUTH_LOGIN_PASSWORD"),
+        ({"OAUTH_LOGIN_PASSWORD": "s3nha"}, "OAUTH_LOGIN_USERNAME"),
+        ({"OAUTH_LOGIN_USERNAME": "caio", "OAUTH_LOGIN_PASSWORD": "   "}, "OAUTH_LOGIN_PASSWORD"),
+    ],
+)
+def test_load_oauth_settings_partial_login_raises(env: dict[str, str], missing: str) -> None:
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_oauth_settings({**_BASE_ENV, **env})
+    assert excinfo.value.details == {"missing_env_var": missing}
+
+
+def test_load_oauth_settings_malformed_hash_raises_without_leaking_value() -> None:
+    bad = "scrypt$not-a-valid$hash-value"
+    with pytest.raises(ConfigurationError) as excinfo:
+        load_oauth_settings(
+            {**_BASE_ENV, "OAUTH_LOGIN_USERNAME": "caio", "OAUTH_LOGIN_PASSWORD": bad}
+        )
+    assert bad not in str(excinfo.value)
+    assert bad not in str(excinfo.value.details)
+
+
+def test_login_password_hidden_from_repr() -> None:
+    settings = OAuthSettings(
+        client_id="x", client_secret="y", login_username="caio", login_password="segredo"
+    )
+    assert "segredo" not in repr(settings)
