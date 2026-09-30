@@ -22,6 +22,13 @@ MSG_REQUEST_EXPIRED: Final[str] = (
     "Esta solicitação de autorização expirou ou já foi usada. "
     "Volte ao aplicativo e inicie a conexão novamente."
 )
+MSG_ENTRA_FAILED: Final[str] = (
+    "Não foi possível concluir o login com a Microsoft. "
+    "Volte ao aplicativo e inicie a conexão novamente."
+)
+MSG_ENTRA_NOT_ALLOWED: Final[str] = (
+    "Sua conta Microsoft não está autorizada a acessar este servidor."
+)
 
 _ORIGIN_RE: Final[re.Pattern[str]] = re.compile(r"^https?://[A-Za-z0-9.\-]+(:\d{1,5})?$")
 

@@ -7,8 +7,8 @@ authorization codes and refresh tokens, which is what RFC 6749 expects.
 Keys are namespaced by a caller-supplied prefix so multiple MCPs can share
 one Redis instance without collisions:
 
-- ``{prefix}:access:{token}``  → ``"1"``  (TTL = access lifetime)
-- ``{prefix}:refresh:{token}`` → ``"1"``  (TTL = refresh lifetime)
+- ``{prefix}:access:{token}``  → ``"1"`` or ``{"subject": ...}`` (TTL = access lifetime)
+- ``{prefix}:refresh:{token}`` → ``"1"`` or ``{"subject": ...}`` (TTL = refresh lifetime)
 - ``{prefix}:code:{code}``     → JSON     (TTL = code lifetime)
 - ``{prefix}:pending_authz:{id}`` → JSON  (TTL = pending /authorize lifetime)
 - ``{prefix}:login_attempts:{ip}`` → int  (TTL = rate-limit window)
@@ -33,11 +33,33 @@ from ..oauth import (
     REFRESH_TOKEN_TTL_SECONDS,
     AuthorizationCodeRecord,
     PendingAuthorizationRecord,
+    RefreshTokenRecord,
 )
 from .base import OAuthStores
 
 REDIS_URL_ENV_VAR = "REDIS_URL"
 REDIS_KEY_PREFIX_ENV_VAR = "REDIS_KEY_PREFIX"
+
+# Anonymous tokens keep the historical ``"1"`` value so entries written by
+# older versions of this library stay valid after an upgrade.
+_ANONYMOUS_VALUE = "1"
+
+
+def _encode_subject(subject: str | None) -> str:
+    if not subject:
+        return _ANONYMOUS_VALUE
+    return json.dumps({"subject": subject}, separators=(",", ":"))
+
+
+def _decode_subject(raw: str | None) -> str | None:
+    if not raw or not raw.startswith("{"):
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    subject = data.get("subject") if isinstance(data, dict) else None
+    return subject if isinstance(subject, str) and subject else None
 
 
 class RedisAccessTokenStore:
@@ -52,15 +74,20 @@ class RedisAccessTokenStore:
         self._prefix = f"{prefix}:access"
         self._ttl = ttl_seconds
 
-    def issue(self) -> tuple[str, int]:
+    def issue(self, *, subject: str | None = None) -> tuple[str, int]:
         token = secrets.token_urlsafe(48)
-        self._r.set(f"{self._prefix}:{token}", "1", ex=self._ttl)
+        self._r.set(f"{self._prefix}:{token}", _encode_subject(subject), ex=self._ttl)
         return token, self._ttl
 
     def is_valid(self, token: str) -> bool:
         if not token:
             return False
         return bool(self._r.exists(f"{self._prefix}:{token}"))
+
+    def subject_of(self, token: str) -> str | None:
+        if not token:
+            return None
+        return _decode_subject(cast(str | None, self._r.get(f"{self._prefix}:{token}")))
 
     def revoke(self, token: str) -> None:
         if token:
@@ -79,16 +106,22 @@ class RedisRefreshTokenStore:
         self._prefix = f"{prefix}:refresh"
         self._ttl = ttl_seconds
 
-    def issue(self) -> str:
+    def issue(self, *, subject: str | None = None) -> str:
         token = secrets.token_urlsafe(64)
-        self._r.set(f"{self._prefix}:{token}", "1", ex=self._ttl)
+        self._r.set(f"{self._prefix}:{token}", _encode_subject(subject), ex=self._ttl)
         return token
 
     def consume(self, token: str) -> bool:
+        return self.pop(token) is not None
+
+    def pop(self, token: str) -> RefreshTokenRecord | None:
         if not token:
-            return False
+            return None
         # GETDEL is atomic in Redis ≥ 6.2 — pop + check existence in one round-trip.
-        return self._r.getdel(f"{self._prefix}:{token}") is not None
+        raw = cast(str | None, self._r.getdel(f"{self._prefix}:{token}"))
+        if raw is None:
+            return None
+        return RefreshTokenRecord(subject=_decode_subject(raw))
 
 
 class RedisAuthCodeStore:
@@ -110,6 +143,7 @@ class RedisAuthCodeStore:
         redirect_uri: str,
         code_challenge: str,
         code_challenge_method: str,
+        subject: str | None = None,
     ) -> str:
         code = secrets.token_urlsafe(48)
         payload = json.dumps(
@@ -118,6 +152,7 @@ class RedisAuthCodeStore:
                 "redirect_uri": redirect_uri,
                 "code_challenge": code_challenge,
                 "code_challenge_method": code_challenge_method,
+                "subject": subject or None,
             },
             separators=(",", ":"),
         )
@@ -136,6 +171,7 @@ class RedisAuthCodeStore:
             redirect_uri=data["redirect_uri"],
             code_challenge=data["code_challenge"],
             code_challenge_method=data["code_challenge_method"],
+            subject=data.get("subject") or None,
         )
 
 
@@ -160,6 +196,7 @@ class RedisPendingAuthorizationStore:
                 "code_challenge": record.code_challenge,
                 "code_challenge_method": record.code_challenge_method,
                 "state": record.state,
+                "nonce": record.nonce,
             },
             separators=(",", ":"),
         )
@@ -188,6 +225,7 @@ class RedisPendingAuthorizationStore:
             code_challenge=data["code_challenge"],
             code_challenge_method=data["code_challenge_method"],
             state=data.get("state", ""),
+            nonce=data.get("nonce", ""),
         )
 
 

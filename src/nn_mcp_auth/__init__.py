@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from .auth import BearerAuthMiddleware, get_subject
+from .entra import EntraAuthError, EntraIdentity, EntraVerifier, build_entra_authorize_url
 from .errors import ConfigurationError, NnMcpAuthError, ValidationError
 from .http import build_oauth_endpoints
 from .oauth import (
+    ENTRA_CALLBACK_PATH,
     AuthorizationCodeRecord,
     OAuthSettings,
     PendingAuthorizationRecord,
+    RefreshTokenRecord,
     client_id_matches,
     credentials_match,
     load_oauth_settings,
@@ -45,6 +48,11 @@ __all__ = [
     # auth
     "BearerAuthMiddleware",
     "get_subject",
+    # entra
+    "EntraAuthError",
+    "EntraIdentity",
+    "EntraVerifier",
+    "build_entra_authorize_url",
     # errors
     "ConfigurationError",
     "NnMcpAuthError",
@@ -52,9 +60,11 @@ __all__ = [
     # http
     "build_oauth_endpoints",
     # oauth
+    "ENTRA_CALLBACK_PATH",
     "AuthorizationCodeRecord",
     "OAuthSettings",
     "PendingAuthorizationRecord",
+    "RefreshTokenRecord",
     "client_id_matches",
     "credentials_match",
     "load_oauth_settings",

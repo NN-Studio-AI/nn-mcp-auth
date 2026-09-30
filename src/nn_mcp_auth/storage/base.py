@@ -16,16 +16,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from ..oauth import AuthorizationCodeRecord, PendingAuthorizationRecord
+from ..oauth import AuthorizationCodeRecord, PendingAuthorizationRecord, RefreshTokenRecord
 
 
 @runtime_checkable
 class AccessTokenStore(Protocol):
-    def issue(self) -> tuple[str, int]:
-        """Mint an access token, returning ``(token, ttl_seconds)``."""
+    def issue(self, *, subject: str | None = None) -> tuple[str, int]:
+        """Mint an access token, returning ``(token, ttl_seconds)``.
+
+        ``subject`` is the identity of the person who logged in (``None`` for
+        service tokens such as ``client_credentials``).
+        """
 
     def is_valid(self, token: str) -> bool:
         """Return ``True`` if the token is currently valid."""
+
+    def subject_of(self, token: str) -> str | None:
+        """Return the subject bound to a valid token; ``None`` when anonymous or unknown."""
 
     def revoke(self, token: str) -> None:
         """Invalidate a token if present. No-op when unknown."""
@@ -33,11 +40,14 @@ class AccessTokenStore(Protocol):
 
 @runtime_checkable
 class RefreshTokenStore(Protocol):
-    def issue(self) -> str:
-        """Mint a refresh token."""
+    def issue(self, *, subject: str | None = None) -> str:
+        """Mint a refresh token carrying ``subject`` (see :class:`AccessTokenStore.issue`)."""
 
     def consume(self, token: str) -> bool:
         """Return ``True`` if the token is valid; invalidates it on success."""
+
+    def pop(self, token: str) -> RefreshTokenRecord | None:
+        """Like :meth:`consume` but returns the stored record (``None`` if invalid)."""
 
 
 @runtime_checkable
@@ -49,8 +59,9 @@ class AuthCodeStore(Protocol):
         redirect_uri: str,
         code_challenge: str,
         code_challenge_method: str,
+        subject: str | None = None,
     ) -> str:
-        """Mint a one-time authorization code bound to PKCE + redirect URI."""
+        """Mint a one-time authorization code bound to PKCE + redirect URI (+ subject)."""
 
     def consume(self, code: str) -> AuthorizationCodeRecord | None:
         """Pop the code if valid; returns ``None`` if absent or expired."""

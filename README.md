@@ -55,6 +55,10 @@ That replaces the entire `auth.py` + `oauth.py` + most of `http_app.py` that use
 | `OAUTH_ISSUER_URL` | Issuer URL announced in metadata and sent as `iss` (RFC 9207) | derived from request scheme/host |
 | `OAUTH_LOGIN_USERNAME` | Username required by the `/authorize` login page | — (empty keeps auto-approve) |
 | `OAUTH_LOGIN_PASSWORD` | Password for the login page: plain text or `scrypt$<salt_b64>$<hash_b64>` | — (empty keeps auto-approve) |
+| `OAUTH_ENTRA_TENANT_ID` | Microsoft Entra ID tenant GUID (Directory ID); with the two vars below, `/authorize` logs the person in via Entra (see [Login com Microsoft Entra ID](#login-com-microsoft-entra-id)) | — (empty disables the Entra login) |
+| `OAUTH_ENTRA_CLIENT_ID` | Application (client) ID of the app registration | — |
+| `OAUTH_ENTRA_CLIENT_SECRET` | Client secret of the app registration | — |
+| `OAUTH_ENTRA_ALLOWED_UPNS` | CSV of e-mails/UPNs allowed to log in | — (any user of the tenant) |
 | `REDIS_URL` | `redis://host:port[/db]` | required for `RedisOAuthStores.from_env()` |
 | `REDIS_KEY_PREFIX` | Namespace per MCP, e.g. `mcp:whatsapp` | required |
 | `LOG_LEVEL` | Stdlib log level for `configure_logging()` | INFO |
@@ -65,6 +69,63 @@ Default `OAUTH_ALLOWED_REDIRECT_URIS` (used when the var is unset):
 - `https://claude.com/api/mcp/auth_callback`
 - `https://chatgpt.com/connector_platform_oauth_redirect`
 - `https://chat.openai.com/connector_platform_oauth_redirect`
+
+## Login com Microsoft Entra ID
+
+Modo principal de login. Com `OAUTH_ENTRA_TENANT_ID`, `OAUTH_ENTRA_CLIENT_ID` e
+`OAUTH_ENTRA_CLIENT_SECRET` preenchidas, `GET /authorize` deixa de aprovar
+automaticamente (e ignora a tela de usuário/senha) e passa a autenticar a
+pessoa na Microsoft:
+
+1. `GET /authorize` valida `client_id`, `redirect_uri` e PKCE como sempre,
+   guarda o pedido pendente (10 minutos, single-use, com um `nonce` novo) e
+   redireciona o navegador para
+   `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize` com
+   `scope=openid profile email`, `state` = id do pedido pendente e o `nonce`.
+   Nenhum `prompt` é enviado: quem já está logado na Microsoft naquele
+   navegador volta sem digitar nada (SSO).
+2. A Microsoft devolve para `{OAUTH_ISSUER_URL}/oauth/entra/callback?code&state`.
+3. O callback consome o pedido pendente, troca o `code` no endpoint de token
+   do tenant **no servidor** (o client secret nunca vai ao navegador) e valida
+   o `id_token`: assinatura RS256 contra o JWKS do tenant (cache de 1 hora,
+   refetch em rotação de chave no máximo a cada 30 s), `iss`, `aud`, `exp`,
+   `nonce` e `tid`.
+4. Se `OAUTH_ENTRA_ALLOWED_UPNS` estiver preenchida, o `preferred_username`
+   precisa estar na lista (comparação sem maiúsculas). Fora da lista → página
+   `403` em português. Sem lista, qualquer usuário do tenant entra.
+5. Só então a biblioteca emite o **próprio** authorization code, com o UPN da
+   pessoa como `subject`, e redireciona ao cliente com `code`, `state` e `iss`.
+
+A identidade viaja com o code até o access token e o refresh token (a rotação
+preserva), e o `BearerAuthMiddleware` a expõe por `get_subject(request)` em
+toda chamada ao MCP. `client_credentials` e o bearer fixo continuam anônimos e
+sem login.
+
+Falhas (state desconhecido ou reutilizado, code inválido, troca recusada,
+`id_token` inválido, usuário fora da lista, erro devolvido pela Microsoft)
+nunca redirecionam ao cliente: respondem uma página HTML em português
+(`400`/`401`/`403`, mesma CSP da tela de login) e a pessoa reinicia a conexão
+pelo aplicativo. Logs: `oauth_login_succeeded` (com `mode=entra` e `subject`),
+`oauth_entra_failed` (com `reason` curto, sem tokens), `oauth_entra_forbidden`,
+`oauth_entra_denied` e `oauth_entra_state_invalid`.
+
+### App registration (Azure Portal → Microsoft Entra ID → App registrations)
+
+- **Supported account types:** somente o tenant da organização (single-tenant).
+- **Redirect URI (plataforma Web):** `{OAUTH_ISSUER_URL}/oauth/entra/callback`,
+  um por MCP (ex.: `https://mcp-resend.nnstudio.ai/oauth/entra/callback`).
+- **Certificates & secrets:** um client secret → `OAUTH_ENTRA_CLIENT_SECRET`.
+- **API permissions:** apenas `openid`, `profile` e `email` (Microsoft Graph,
+  delegadas). Nada de `User.Read.All` ou permissões de aplicação.
+- **Overview:** `Application (client) ID` → `OAUTH_ENTRA_CLIENT_ID`;
+  `Directory (tenant) ID` → `OAUTH_ENTRA_TENANT_ID` (o GUID, não o domínio).
+- `OAUTH_ISSUER_URL` precisa ser a origin pública do MCP, porque ela compõe o
+  redirect URI enviado à Microsoft.
+
+Precedência dos modos de `/authorize`: Entra (`OAUTH_ENTRA_*`) > usuário/senha
+(`OAUTH_LOGIN_*`) > aprovação automática (nenhuma das duas). As três vars do
+Entra devem ser definidas juntas ou ficar todas vazias; combinação parcial é
+`ConfigurationError` na carga.
 
 ## Tela de login
 

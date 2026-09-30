@@ -15,6 +15,7 @@ from ..oauth import (
     REFRESH_TOKEN_TTL_SECONDS,
     AuthorizationCodeRecord,
     PendingAuthorizationRecord,
+    RefreshTokenRecord,
 )
 from .base import OAuthStores
 
@@ -22,12 +23,13 @@ from .base import OAuthStores
 @dataclass(slots=True)
 class MemoryAccessTokenStore:
     ttl_seconds: int = DEFAULT_OAUTH_TOKEN_TTL_SECONDS
-    _tokens: dict[str, float] = field(default_factory=dict)
+    # token -> (expires_at, subject)
+    _tokens: dict[str, tuple[float, str | None]] = field(default_factory=dict)
     _clock: Callable[[], float] = field(default=time.monotonic)
 
-    def issue(self) -> tuple[str, int]:
+    def issue(self, *, subject: str | None = None) -> tuple[str, int]:
         token = secrets.token_urlsafe(48)
-        self._tokens[token] = self._clock() + self.ttl_seconds
+        self._tokens[token] = (self._clock() + self.ttl_seconds, subject or None)
         self._purge_expired()
         return token, self.ttl_seconds
 
@@ -37,12 +39,19 @@ class MemoryAccessTokenStore:
         self._purge_expired()
         return token in self._tokens
 
+    def subject_of(self, token: str) -> str | None:
+        if not token:
+            return None
+        self._purge_expired()
+        stored = self._tokens.get(token)
+        return stored[1] if stored is not None else None
+
     def revoke(self, token: str) -> None:
         self._tokens.pop(token, None)
 
     def _purge_expired(self) -> None:
         now = self._clock()
-        expired = [t for t, exp in self._tokens.items() if exp <= now]
+        expired = [t for t, (exp, _) in self._tokens.items() if exp <= now]
         for t in expired:
             del self._tokens[t]
 
@@ -50,25 +59,32 @@ class MemoryAccessTokenStore:
 @dataclass(slots=True)
 class MemoryRefreshTokenStore:
     ttl_seconds: int = REFRESH_TOKEN_TTL_SECONDS
-    _tokens: dict[str, float] = field(default_factory=dict)
+    # token -> (expires_at, subject)
+    _tokens: dict[str, tuple[float, str | None]] = field(default_factory=dict)
     _clock: Callable[[], float] = field(default=time.monotonic)
 
-    def issue(self) -> str:
+    def issue(self, *, subject: str | None = None) -> str:
         token = secrets.token_urlsafe(64)
-        self._tokens[token] = self._clock() + self.ttl_seconds
+        self._tokens[token] = (self._clock() + self.ttl_seconds, subject or None)
         self._purge_expired()
         return token
 
     def consume(self, token: str) -> bool:
+        return self.pop(token) is not None
+
+    def pop(self, token: str) -> RefreshTokenRecord | None:
         self._purge_expired()
-        expires_at = self._tokens.pop(token, None)
-        if expires_at is None:
-            return False
-        return expires_at > self._clock()
+        stored = self._tokens.pop(token, None)
+        if stored is None:
+            return None
+        expires_at, subject = stored
+        if expires_at <= self._clock():
+            return None
+        return RefreshTokenRecord(subject=subject)
 
     def _purge_expired(self) -> None:
         now = self._clock()
-        expired = [t for t, exp in self._tokens.items() if exp <= now]
+        expired = [t for t, (exp, _) in self._tokens.items() if exp <= now]
         for t in expired:
             del self._tokens[t]
 
@@ -92,6 +108,7 @@ class MemoryAuthCodeStore:
         redirect_uri: str,
         code_challenge: str,
         code_challenge_method: str,
+        subject: str | None = None,
     ) -> str:
         code = secrets.token_urlsafe(48)
         self._codes[code] = _StoredCode(
@@ -100,6 +117,7 @@ class MemoryAuthCodeStore:
                 redirect_uri=redirect_uri,
                 code_challenge=code_challenge,
                 code_challenge_method=code_challenge_method,
+                subject=subject or None,
             ),
             expires_at=self._clock() + self.ttl_seconds,
         )

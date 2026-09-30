@@ -42,8 +42,12 @@ class BearerAuthMiddleware:
       :func:`get_subject`.
 
     Optionally also accepts any token that ``oauth_store.is_valid()`` reports
-    as valid (the OAuth-issued bearer flow). Tokens minted via OAuth do not
-    carry identity in this minor version — that is the next milestone.
+    as valid (the OAuth-issued bearer flow). When the store also implements
+    ``subject_of`` (every store in this library does), the identity bound to
+    the token by the ``/authorize`` login (UPN in Entra mode, username in
+    password mode) is attached to the scope the same way, so
+    :func:`get_subject` works for OAuth callers too. Service tokens
+    (``client_credentials``) stay anonymous.
 
     All other requests pass through untouched, so callers can layer this
     middleware on a Starlette app that has additional unauthenticated
@@ -89,6 +93,10 @@ class BearerAuthMiddleware:
                 return
 
         if self.oauth_store is not None and self.oauth_store.is_valid(provided_token):
+            subject_of = getattr(self.oauth_store, "subject_of", None)
+            subject = subject_of(provided_token) if callable(subject_of) else None
+            if isinstance(subject, str) and subject:
+                scope[SCOPE_STATE_SUBJECT_KEY] = subject  # type: ignore[index]
             await self.app(scope, receive, send)
             return
 
