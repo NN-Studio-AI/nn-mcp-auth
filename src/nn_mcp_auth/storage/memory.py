@@ -10,8 +10,11 @@ from dataclasses import dataclass, field
 from ..oauth import (
     AUTHORIZATION_CODE_TTL_SECONDS,
     DEFAULT_OAUTH_TOKEN_TTL_SECONDS,
+    LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    PENDING_AUTHORIZATION_TTL_SECONDS,
     REFRESH_TOKEN_TTL_SECONDS,
     AuthorizationCodeRecord,
+    PendingAuthorizationRecord,
 )
 from .base import OAuthStores
 
@@ -119,6 +122,60 @@ class MemoryAuthCodeStore:
             del self._codes[c]
 
 
+@dataclass(slots=True)
+class _StoredPending:
+    record: PendingAuthorizationRecord
+    expires_at: float
+
+
+@dataclass(slots=True)
+class MemoryPendingAuthorizationStore:
+    ttl_seconds: int = PENDING_AUTHORIZATION_TTL_SECONDS
+    _requests: dict[str, _StoredPending] = field(default_factory=dict)
+    _clock: Callable[[], float] = field(default=time.monotonic)
+
+    def create(self, record: PendingAuthorizationRecord) -> str:
+        request_id = secrets.token_urlsafe(32)
+        self._requests[request_id] = _StoredPending(
+            record=record, expires_at=self._clock() + self.ttl_seconds
+        )
+        self._purge_expired()
+        return request_id
+
+    def get(self, request_id: str) -> PendingAuthorizationRecord | None:
+        self._purge_expired()
+        stored = self._requests.get(request_id)
+        return stored.record if stored is not None else None
+
+    def consume(self, request_id: str) -> PendingAuthorizationRecord | None:
+        self._purge_expired()
+        stored = self._requests.pop(request_id, None)
+        return stored.record if stored is not None else None
+
+    def _purge_expired(self) -> None:
+        now = self._clock()
+        expired = [k for k, v in self._requests.items() if v.expires_at <= now]
+        for k in expired:
+            del self._requests[k]
+
+
+@dataclass(slots=True)
+class MemoryLoginAttemptLimiter:
+    window_seconds: int = LOGIN_RATE_LIMIT_WINDOW_SECONDS
+    _windows: dict[str, tuple[int, float]] = field(default_factory=dict)
+    _clock: Callable[[], float] = field(default=time.monotonic)
+
+    def hit(self, key: str) -> tuple[int, int]:
+        now = self._clock()
+        expired = [k for k, (_, reset_at) in self._windows.items() if reset_at <= now]
+        for k in expired:
+            del self._windows[k]
+        count, reset_at = self._windows.get(key, (0, now + self.window_seconds))
+        count += 1
+        self._windows[key] = (count, reset_at)
+        return count, max(1, int(round(reset_at - now)))
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryOAuthStores(OAuthStores):
     @classmethod
@@ -128,9 +185,13 @@ class MemoryOAuthStores(OAuthStores):
         access_ttl: int = DEFAULT_OAUTH_TOKEN_TTL_SECONDS,
         refresh_ttl: int = REFRESH_TOKEN_TTL_SECONDS,
         code_ttl: int = AUTHORIZATION_CODE_TTL_SECONDS,
+        pending_ttl: int = PENDING_AUTHORIZATION_TTL_SECONDS,
+        login_window: int = LOGIN_RATE_LIMIT_WINDOW_SECONDS,
     ) -> MemoryOAuthStores:
         return cls(
             access=MemoryAccessTokenStore(ttl_seconds=access_ttl),
             refresh=MemoryRefreshTokenStore(ttl_seconds=refresh_ttl),
             code=MemoryAuthCodeStore(ttl_seconds=code_ttl),
+            pending=MemoryPendingAuthorizationStore(ttl_seconds=pending_ttl),
+            login_limiter=MemoryLoginAttemptLimiter(window_seconds=login_window),
         )

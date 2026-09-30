@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from nn_mcp_auth.oauth import PendingAuthorizationRecord
 from nn_mcp_auth.storage.memory import (
     MemoryAccessTokenStore,
     MemoryAuthCodeStore,
+    MemoryLoginAttemptLimiter,
     MemoryOAuthStores,
+    MemoryPendingAuthorizationStore,
     MemoryRefreshTokenStore,
 )
 
@@ -101,3 +104,50 @@ def test_memory_oauth_stores_factory() -> None:
     assert stores.access.ttl_seconds == 60
     assert stores.refresh.ttl_seconds == 120
     assert stores.code.ttl_seconds == 30
+
+
+def _pending_record() -> PendingAuthorizationRecord:
+    return PendingAuthorizationRecord(
+        client_id="cid",
+        redirect_uri="https://chatgpt.com/connector_platform_oauth_redirect",
+        code_challenge="abc",
+        code_challenge_method="S256",
+        state="st",
+    )
+
+
+def test_pending_authorization_get_then_consume_once() -> None:
+    clock = FakeClock()
+    store = MemoryPendingAuthorizationStore(ttl_seconds=600, _clock=clock)
+    request_id = store.create(_pending_record())
+    assert store.get(request_id) == _pending_record()
+    assert store.get(request_id) == _pending_record()  # get does not consume
+    assert store.consume(request_id) == _pending_record()
+    assert store.consume(request_id) is None
+    assert store.get(request_id) is None
+
+
+def test_pending_authorization_expires() -> None:
+    clock = FakeClock()
+    store = MemoryPendingAuthorizationStore(ttl_seconds=600, _clock=clock)
+    request_id = store.create(_pending_record())
+    clock.value = 600
+    assert store.get(request_id) is None
+    assert store.consume(request_id) is None
+
+
+def test_login_limiter_fixed_window() -> None:
+    clock = FakeClock()
+    limiter = MemoryLoginAttemptLimiter(window_seconds=600, _clock=clock)
+    assert limiter.hit("1.2.3.4") == (1, 600)
+    clock.value = 100
+    assert limiter.hit("1.2.3.4") == (2, 500)
+    assert limiter.hit("5.6.7.8") == (1, 600)
+    clock.value = 600
+    assert limiter.hit("1.2.3.4") == (1, 600)
+
+
+def test_memory_stores_create_includes_login_stores() -> None:
+    stores = MemoryOAuthStores.create()
+    assert isinstance(stores.pending, MemoryPendingAuthorizationStore)
+    assert isinstance(stores.login_limiter, MemoryLoginAttemptLimiter)

@@ -13,16 +13,19 @@ import hashlib
 import os
 import secrets
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 from .errors import ConfigurationError
+from .password import is_scrypt_hash, parse_scrypt_hash
 
 OAUTH_CLIENT_ID_ENV_VAR: Final[str] = "OAUTH_CLIENT_ID"
 OAUTH_CLIENT_SECRET_ENV_VAR: Final[str] = "OAUTH_CLIENT_SECRET"
 OAUTH_TOKEN_TTL_ENV_VAR: Final[str] = "OAUTH_TOKEN_TTL_SECONDS"
 OAUTH_ALLOWED_REDIRECT_URIS_ENV_VAR: Final[str] = "OAUTH_ALLOWED_REDIRECT_URIS"
 OAUTH_ISSUER_URL_ENV_VAR: Final[str] = "OAUTH_ISSUER_URL"
+OAUTH_LOGIN_USERNAME_ENV_VAR: Final[str] = "OAUTH_LOGIN_USERNAME"
+OAUTH_LOGIN_PASSWORD_ENV_VAR: Final[str] = "OAUTH_LOGIN_PASSWORD"
 
 DEFAULT_OAUTH_TOKEN_TTL_SECONDS: Final[int] = 3600
 MIN_OAUTH_TOKEN_TTL_SECONDS: Final[int] = 60
@@ -30,10 +33,15 @@ MAX_OAUTH_TOKEN_TTL_SECONDS: Final[int] = 86_400
 
 AUTHORIZATION_CODE_TTL_SECONDS: Final[int] = 600
 REFRESH_TOKEN_TTL_SECONDS: Final[int] = 60 * 60 * 24 * 90  # 90 days
+PENDING_AUTHORIZATION_TTL_SECONDS: Final[int] = 600
+LOGIN_RATE_LIMIT_MAX_ATTEMPTS: Final[int] = 10
+LOGIN_RATE_LIMIT_WINDOW_SECONDS: Final[int] = 600
 
 DEFAULT_ALLOWED_REDIRECT_URIS: Final[tuple[str, ...]] = (
     "https://claude.ai/api/mcp/auth_callback",
     "https://claude.com/api/mcp/auth_callback",
+    "https://chatgpt.com/connector_platform_oauth_redirect",
+    "https://chat.openai.com/connector_platform_oauth_redirect",
 )
 
 
@@ -44,15 +52,39 @@ class OAuthSettings:
     token_ttl_seconds: int = DEFAULT_OAUTH_TOKEN_TTL_SECONDS
     allowed_redirect_uris: tuple[str, ...] = DEFAULT_ALLOWED_REDIRECT_URIS
     issuer_url: str = ""
+    login_username: str = ""
+    # Plain text or ``scrypt$<salt_b64>$<hash_b64>``; never shown in repr.
+    login_password: str = field(default="", repr=False)
 
     @property
     def enabled(self) -> bool:
         return bool(self.client_id) and bool(self.client_secret)
 
+    @property
+    def login_enabled(self) -> bool:
+        """``True`` when ``/authorize`` must show the login page before issuing a code."""
+
+        return bool(self.login_username) and bool(self.login_password)
+
     def is_redirect_uri_allowed(self, redirect_uri: str) -> bool:
         if not redirect_uri:
             return False
         return redirect_uri in self.allowed_redirect_uris
+
+
+@dataclass(frozen=True, slots=True)
+class PendingAuthorizationRecord:
+    """A validated ``GET /authorize`` request waiting for the login form.
+
+    Persisted between the login page render and the ``POST /authorize``
+    submission; single-use and short-lived (``PENDING_AUTHORIZATION_TTL_SECONDS``).
+    """
+
+    client_id: str
+    redirect_uri: str
+    code_challenge: str
+    code_challenge_method: str
+    state: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,13 +176,51 @@ def load_oauth_settings(env: Mapping[str, str] | None = None) -> OAuthSettings:
 
     issuer_url = env.get(OAUTH_ISSUER_URL_ENV_VAR, "").strip().rstrip("/")
 
+    login_username, login_password = _load_login_credentials(env)
+
     return OAuthSettings(
         client_id=client_id,
         client_secret=client_secret,
         token_ttl_seconds=ttl_seconds,
         allowed_redirect_uris=allowed_redirect_uris,
         issuer_url=issuer_url,
+        login_username=login_username,
+        login_password=login_password,
     )
+
+
+def _load_login_credentials(env: Mapping[str, str]) -> tuple[str, str]:
+    """Read the optional /authorize login credentials.
+
+    Both empty → login page disabled (auto-approve, the pre-0.3.0 behavior).
+    Only one set → :class:`ConfigurationError`, mirroring the client id/secret
+    rule. A value starting with ``scrypt$`` must be a well-formed hash.
+    """
+
+    username = env.get(OAUTH_LOGIN_USERNAME_ENV_VAR, "").strip()
+    # Stripped like every other var: stray whitespace pasted into the deploy
+    # panel is far more common than an intentional leading/trailing space.
+    password = env.get(OAUTH_LOGIN_PASSWORD_ENV_VAR, "").strip()
+
+    if bool(username) != bool(password):
+        missing = OAUTH_LOGIN_USERNAME_ENV_VAR if not username else OAUTH_LOGIN_PASSWORD_ENV_VAR
+        raise ConfigurationError(
+            "OAuth login credentials are partially configured. Both "
+            "OAUTH_LOGIN_USERNAME and OAUTH_LOGIN_PASSWORD must be set together, "
+            "or both left empty to keep /authorize auto-approving.",
+            details={"missing_env_var": missing},
+        )
+
+    if is_scrypt_hash(password) and parse_scrypt_hash(password) is None:
+        # Never echo the value itself: it is a credential.
+        raise ConfigurationError(
+            f"{OAUTH_LOGIN_PASSWORD_ENV_VAR} starts with 'scrypt$' but is not a valid "
+            "'scrypt$<salt_b64>$<hash_b64>' hash. Generate one with "
+            "'python -m nn_mcp_auth.hash_password'.",
+            details={"env_var": OAUTH_LOGIN_PASSWORD_ENV_VAR},
+        )
+
+    return username, password
 
 
 def parse_basic_auth(authorization_header: str) -> tuple[str, str] | None:

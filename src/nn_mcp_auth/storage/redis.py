@@ -10,6 +10,8 @@ one Redis instance without collisions:
 - ``{prefix}:access:{token}``  → ``"1"``  (TTL = access lifetime)
 - ``{prefix}:refresh:{token}`` → ``"1"``  (TTL = refresh lifetime)
 - ``{prefix}:code:{code}``     → JSON     (TTL = code lifetime)
+- ``{prefix}:pending_authz:{id}`` → JSON  (TTL = pending /authorize lifetime)
+- ``{prefix}:login_attempts:{ip}`` → int  (TTL = rate-limit window)
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import json
 import os
 import secrets
 from dataclasses import dataclass
+from typing import Any, cast
 
 import redis
 
@@ -25,8 +28,11 @@ from ..errors import ConfigurationError
 from ..oauth import (
     AUTHORIZATION_CODE_TTL_SECONDS,
     DEFAULT_OAUTH_TOKEN_TTL_SECONDS,
+    LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    PENDING_AUTHORIZATION_TTL_SECONDS,
     REFRESH_TOKEN_TTL_SECONDS,
     AuthorizationCodeRecord,
+    PendingAuthorizationRecord,
 )
 from .base import OAuthStores
 
@@ -121,7 +127,7 @@ class RedisAuthCodeStore:
     def consume(self, code: str) -> AuthorizationCodeRecord | None:
         if not code:
             return None
-        raw = self._r.getdel(f"{self._prefix}:{code}")
+        raw = cast(str | None, self._r.getdel(f"{self._prefix}:{code}"))
         if not raw:
             return None
         data = json.loads(raw)
@@ -131,6 +137,87 @@ class RedisAuthCodeStore:
             code_challenge=data["code_challenge"],
             code_challenge_method=data["code_challenge_method"],
         )
+
+
+class RedisPendingAuthorizationStore:
+    def __init__(
+        self,
+        client: redis.Redis,
+        *,
+        prefix: str,
+        ttl_seconds: int = PENDING_AUTHORIZATION_TTL_SECONDS,
+    ) -> None:
+        self._r = client
+        self._prefix = f"{prefix}:pending_authz"
+        self._ttl = ttl_seconds
+
+    def create(self, record: PendingAuthorizationRecord) -> str:
+        request_id = secrets.token_urlsafe(32)
+        payload = json.dumps(
+            {
+                "client_id": record.client_id,
+                "redirect_uri": record.redirect_uri,
+                "code_challenge": record.code_challenge,
+                "code_challenge_method": record.code_challenge_method,
+                "state": record.state,
+            },
+            separators=(",", ":"),
+        )
+        self._r.set(f"{self._prefix}:{request_id}", payload, ex=self._ttl)
+        return request_id
+
+    def get(self, request_id: str) -> PendingAuthorizationRecord | None:
+        if not request_id:
+            return None
+        return self._decode(cast(str | None, self._r.get(f"{self._prefix}:{request_id}")))
+
+    def consume(self, request_id: str) -> PendingAuthorizationRecord | None:
+        if not request_id:
+            return None
+        # GETDEL keeps the request single-use even with concurrent submissions.
+        return self._decode(cast(str | None, self._r.getdel(f"{self._prefix}:{request_id}")))
+
+    @staticmethod
+    def _decode(raw: str | None) -> PendingAuthorizationRecord | None:
+        if not raw:
+            return None
+        data: dict[str, Any] = json.loads(raw)
+        return PendingAuthorizationRecord(
+            client_id=data["client_id"],
+            redirect_uri=data["redirect_uri"],
+            code_challenge=data["code_challenge"],
+            code_challenge_method=data["code_challenge_method"],
+            state=data.get("state", ""),
+        )
+
+
+class RedisLoginAttemptLimiter:
+    """Fixed-window counter: ``SET key 0 NX EX window`` then ``INCR``, in one MULTI.
+
+    Creating the key with its TTL before incrementing means a crash between
+    the two commands can never leave an immortal counter (permanent lockout).
+    """
+
+    def __init__(
+        self,
+        client: redis.Redis,
+        *,
+        prefix: str,
+        window_seconds: int = LOGIN_RATE_LIMIT_WINDOW_SECONDS,
+    ) -> None:
+        self._r = client
+        self._prefix = f"{prefix}:login_attempts"
+        self._window = window_seconds
+
+    def hit(self, key: str) -> tuple[int, int]:
+        redis_key = f"{self._prefix}:{key}"
+        pipe = self._r.pipeline(transaction=True)
+        pipe.set(redis_key, 0, nx=True, ex=self._window)
+        pipe.incr(redis_key)
+        pipe.ttl(redis_key)
+        _, count, ttl = pipe.execute()
+        remaining = int(ttl) if isinstance(ttl, int) and ttl > 0 else self._window
+        return int(count), remaining
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,4 +267,6 @@ class RedisOAuthStores(OAuthStores):
             access=RedisAccessTokenStore(client, prefix=prefix, ttl_seconds=access_ttl),
             refresh=RedisRefreshTokenStore(client, prefix=prefix, ttl_seconds=refresh_ttl),
             code=RedisAuthCodeStore(client, prefix=prefix, ttl_seconds=code_ttl),
+            pending=RedisPendingAuthorizationStore(client, prefix=prefix),
+            login_limiter=RedisLoginAttemptLimiter(client, prefix=prefix),
         )

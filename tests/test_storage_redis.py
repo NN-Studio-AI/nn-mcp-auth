@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import fakeredis
 import pytest
 
 from nn_mcp_auth.errors import ConfigurationError
+from nn_mcp_auth.oauth import PendingAuthorizationRecord
 from nn_mcp_auth.storage.redis import (
     RedisAccessTokenStore,
     RedisAuthCodeStore,
+    RedisLoginAttemptLimiter,
     RedisOAuthStores,
+    RedisPendingAuthorizationStore,
     RedisRefreshTokenStore,
 )
 
@@ -94,3 +99,45 @@ def test_redis_oauth_stores_from_env_requires_url() -> None:
 def test_redis_oauth_stores_from_env_requires_prefix() -> None:
     with pytest.raises(ConfigurationError):
         RedisOAuthStores.from_env({"REDIS_URL": "redis://localhost:6379/0"})
+
+
+def test_redis_pending_authorization_roundtrip(client: fakeredis.FakeRedis) -> None:
+    store = RedisPendingAuthorizationStore(client, prefix="mcp:test", ttl_seconds=600)
+    record = PendingAuthorizationRecord(
+        client_id="cid",
+        redirect_uri="https://chatgpt.com/connector_platform_oauth_redirect",
+        code_challenge="abc",
+        code_challenge_method="S256",
+        state="st",
+    )
+    request_id = store.create(record)
+    assert cast(int, client.ttl(f"mcp:test:pending_authz:{request_id}")) == 600
+    assert store.get(request_id) == record
+    assert store.consume(request_id) == record
+    assert store.consume(request_id) is None
+    assert store.get(request_id) is None
+    assert store.get("") is None and store.consume("") is None
+
+
+def test_redis_login_limiter_counts_and_sets_ttl(client: fakeredis.FakeRedis) -> None:
+    limiter = RedisLoginAttemptLimiter(client, prefix="mcp:test", window_seconds=600)
+    assert limiter.hit("1.2.3.4") == (1, 600)
+    count, remaining = limiter.hit("1.2.3.4")
+    assert count == 2
+    assert 0 < remaining <= 600
+    assert cast(int, client.ttl("mcp:test:login_attempts:1.2.3.4")) > 0
+    assert limiter.hit("::1") == (1, 600)
+
+
+def test_redis_login_limiter_window_resets(client: fakeredis.FakeRedis) -> None:
+    limiter = RedisLoginAttemptLimiter(client, prefix="mcp:test", window_seconds=600)
+    limiter.hit("ip")
+    limiter.hit("ip")
+    client.delete("mcp:test:login_attempts:ip")  # simulates TTL expiry
+    assert limiter.hit("ip")[0] == 1
+
+
+def test_redis_oauth_stores_include_login_stores(client: fakeredis.FakeRedis) -> None:
+    stores = RedisOAuthStores.from_client(client, prefix="mcp:test")
+    assert isinstance(stores.pending, RedisPendingAuthorizationStore)
+    assert isinstance(stores.login_limiter, RedisLoginAttemptLimiter)

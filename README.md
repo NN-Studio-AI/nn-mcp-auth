@@ -8,7 +8,7 @@ Implements the three grant types that claude.ai custom connectors and headless s
 - **Refresh Token rotation** (RFC 6749 §6) — claude.ai rotates on every refresh
 - **Client Credentials** (RFC 6749 §4.4) — for headless callers holding `client_id` + `client_secret`
 
-Plus a `BearerAuthMiddleware` that protects MCP routes with either the static `MCP_AUTH_TOKEN` or an OAuth-issued access token, and an RFC 8414 metadata endpoint.
+Plus a `BearerAuthMiddleware` that protects MCP routes with either the static `MCP_AUTH_TOKEN` or an OAuth-issued access token, an RFC 8414 metadata endpoint (also served at `/.well-known/openid-configuration`), RFC 9728 protected-resource metadata, and an optional login page on `/authorize` (see [Tela de login](#tela-de-login)).
 
 ## Why this exists
 
@@ -51,15 +51,109 @@ That replaces the entire `auth.py` + `oauth.py` + most of `http_app.py` that use
 | `OAUTH_CLIENT_ID` | Client id callers must present | — (empty disables OAuth) |
 | `OAUTH_CLIENT_SECRET` | Client secret callers must present | — |
 | `OAUTH_TOKEN_TTL_SECONDS` | Access token lifetime | 3600 |
-| `OAUTH_ALLOWED_REDIRECT_URIS` | CSV of allowed redirect URIs for code grant | claude.ai defaults |
-| `OAUTH_ISSUER_URL` | Issuer URL announced in metadata | derived from request scheme/host |
+| `OAUTH_ALLOWED_REDIRECT_URIS` | CSV of allowed redirect URIs for code grant | claude.ai, claude.com, chatgpt.com and chat.openai.com callbacks |
+| `OAUTH_ISSUER_URL` | Issuer URL announced in metadata and sent as `iss` (RFC 9207) | derived from request scheme/host |
+| `OAUTH_LOGIN_USERNAME` | Username required by the `/authorize` login page | — (empty keeps auto-approve) |
+| `OAUTH_LOGIN_PASSWORD` | Password for the login page: plain text or `scrypt$<salt_b64>$<hash_b64>` | — (empty keeps auto-approve) |
 | `REDIS_URL` | `redis://host:port[/db]` | required for `RedisOAuthStores.from_env()` |
 | `REDIS_KEY_PREFIX` | Namespace per MCP, e.g. `mcp:whatsapp` | required |
 | `LOG_LEVEL` | Stdlib log level for `configure_logging()` | INFO |
 
+Default `OAUTH_ALLOWED_REDIRECT_URIS` (used when the var is unset):
+
+- `https://claude.ai/api/mcp/auth_callback`
+- `https://claude.com/api/mcp/auth_callback`
+- `https://chatgpt.com/connector_platform_oauth_redirect`
+- `https://chat.openai.com/connector_platform_oauth_redirect`
+
+## Tela de login
+
+Por padrão (`OAUTH_LOGIN_USERNAME` e `OAUTH_LOGIN_PASSWORD` vazias) o
+`GET /authorize` aprova automaticamente: valida `client_id`, `redirect_uri` e
+PKCE e já redireciona com o `code`. Esse é o comportamento de todas as versões
+até a `v0.2.2` e continua idêntico na `v0.3.0` quando as duas variáveis estão vazias.
+
+Com as duas variáveis preenchidas, o fluxo passa a exigir login:
+
+1. `GET /authorize` valida os parâmetros como antes, grava um *pending
+   authorization request* no store (Redis ou memória) com id aleatório e TTL de
+   10 minutos e responde uma página HTML de login em português (CSS inline, sem
+   JavaScript, sem assets externos).
+2. O formulário faz `POST /authorize` com `request_id`, `username` e `password`.
+   As credenciais são comparadas em tempo constante (usuário e senha são sempre
+   avaliados, sem curto-circuito).
+3. Sucesso: o pending request é consumido (uso único, `GETDEL` no Redis), o
+   `code` é emitido e a resposta é `302` para o `redirect_uri` com `code`,
+   `state` e `iss` (RFC 9207). A metadata passa a anunciar
+   `authorization_response_iss_parameter_supported: true`.
+4. Erro: a página é re-renderizada com status `401` e a mensagem genérica
+   "Usuário ou senha inválidos." (sem revelar qual campo errou). O mesmo
+   `request_id` continua válido até expirar.
+5. Rate limit: 10 tentativas de `POST /authorize` por IP a cada 10 minutos
+   (janela fixa no store). Excedido, a resposta é `429` com a mesma página,
+   mensagem em português e cabeçalho `Retry-After`.
+
+Cabeçalhos da página: `Content-Security-Policy: default-src 'none';
+style-src 'unsafe-inline'; form-action 'self' <origin do redirect_uri>;
+frame-ancestors 'none'; base-uri 'none'`, `X-Frame-Options: DENY`,
+`Cache-Control: no-store`, `Referrer-Policy: no-referrer`. A origin do
+`redirect_uri` (sempre vinda da allowlist) entra no `form-action` porque os
+navegadores aplicam essa diretiva também ao redirect que segue o POST do
+formulário; só com `'self'` o `302` final para o cliente OAuth seria bloqueado.
+
+`client_credentials` nunca passa pela tela de login. `refresh_token` também não.
+
+Logs: os eventos `oauth_login_succeeded`, `oauth_login_failed`,
+`oauth_login_rate_limited` e `oauth_login_request_invalid` saem no logger
+`nn_mcp_auth` com `client_ip` (nunca usuário ou senha). Chame
+`configure_logging(logger_name="nn_mcp_auth")` no entrypoint do MCP para
+recebê-los como JSON.
+
+### Senha em hash
+
+`OAUTH_LOGIN_PASSWORD` aceita texto puro ou hash scrypt
+(`scrypt$<salt_b64>$<hash_b64>`, N=16384, r=8, p=1, os mesmos defaults do
+`crypto.scryptSync` do Node). Para gerar o hash:
+
+```bash
+uv run python -m nn_mcp_auth.hash_password            # pergunta a senha duas vezes
+printf '%s' "$SENHA" | uv run python -m nn_mcp_auth.hash_password
+```
+
+Só o hash vai para o stdout. Um valor que começa com `scrypt$` mas está
+malformado derruba a carga da configuração com `ConfigurationError` (o valor
+não aparece na mensagem). Preencher só uma das duas variáveis também gera
+`ConfigurationError`, no mesmo padrão de `OAUTH_CLIENT_ID`/`OAUTH_CLIENT_SECRET`.
+
+### IP do cliente atrás de proxy
+
+O rate limit usa `request.client.host`, que respeita o tratamento de proxy do
+uvicorn. Atrás do Traefik do Coolify, configure `FORWARDED_ALLOW_IPS` (ex.:
+`FORWARDED_ALLOW_IPS=*` quando só o Traefik alcança o container; por padrão o
+Traefik descarta o `X-Forwarded-For` enviado por clientes não confiáveis e grava
+o IP real) para que cada usuário tenha a própria janela; sem isso todos
+compartilham o IP do proxy e o
+limite passa a ser global (mais restritivo, nunca mais permissivo). O cabeçalho
+`X-Forwarded-For` cru não é lido pela biblioteca, para não permitir contornar o
+limite trocando o cabeçalho.
+
+### Stores
+
+`RedisOAuthStores` e `MemoryOAuthStores.create()` já trazem os stores novos
+(`pending` e `login_limiter`). Quem monta `OAuthStores(access=..., refresh=...,
+code=...)` na mão continua funcionando: com o login ligado, a biblioteca usa
+versões em memória como fallback (ok para uma réplica; prefira Redis).
+
+Chaves novas no Redis:
+
+- `{prefix}:pending_authz:{id}` → JSON do pedido (TTL 600 s)
+- `{prefix}:login_attempts:{ip}` → contador (TTL 600 s)
+
 ## Run tests
 
 ```bash
-uv sync
+uv sync --python 3.12 --extra dev
 uv run pytest
+uv run ruff check
+uv run mypy src tests
 ```

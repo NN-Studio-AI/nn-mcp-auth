@@ -2,8 +2,13 @@
 
 Each store has a small, opinionated interface so any backend (in-memory,
 Redis, future SQL) implements the same shape. The :class:`OAuthStores`
-dataclass bundles the three stores so the HTTP endpoint factory can take
-a single argument.
+dataclass bundles the stores so the HTTP endpoint factory can take a single
+argument.
+
+``pending`` and ``login_limiter`` only matter when the /authorize login page
+is enabled (``OAUTH_LOGIN_USERNAME`` + ``OAUTH_LOGIN_PASSWORD``). They are
+optional so hand-built ``OAuthStores(access=..., refresh=..., code=...)``
+keeps working; the endpoint factory falls back to in-memory versions.
 """
 
 from __future__ import annotations
@@ -11,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from ..oauth import AuthorizationCodeRecord
+from ..oauth import AuthorizationCodeRecord, PendingAuthorizationRecord
 
 
 @runtime_checkable
@@ -51,8 +56,31 @@ class AuthCodeStore(Protocol):
         """Pop the code if valid; returns ``None`` if absent or expired."""
 
 
+@runtime_checkable
+class PendingAuthorizationStore(Protocol):
+    def create(self, record: PendingAuthorizationRecord) -> str:
+        """Persist a validated /authorize request; returns a random single-use id."""
+
+    def get(self, request_id: str) -> PendingAuthorizationRecord | None:
+        """Read without consuming (used to re-render the form after a bad login)."""
+
+    def consume(self, request_id: str) -> PendingAuthorizationRecord | None:
+        """Atomically pop the request; ``None`` if absent, expired or already used."""
+
+
+@runtime_checkable
+class LoginAttemptLimiter(Protocol):
+    def hit(self, key: str) -> tuple[int, int]:
+        """Count one attempt for ``key`` in a fixed window.
+
+        Returns ``(attempts_in_window, seconds_until_window_resets)``.
+        """
+
+
 @dataclass(frozen=True, slots=True)
 class OAuthStores:
     access: AccessTokenStore
     refresh: RefreshTokenStore
     code: AuthCodeStore
+    pending: PendingAuthorizationStore | None = None
+    login_limiter: LoginAttemptLimiter | None = None
