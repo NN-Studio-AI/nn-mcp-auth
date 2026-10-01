@@ -24,14 +24,14 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Final
 from urllib.parse import urlencode
 
 import httpx
 import jwt
-from jwt import PyJWK
 
 from .errors import NnMcpAuthError
+from .jwks import JwksCache, JwksError
 from .oauth import OAuthSettings
 from .runtime import log_json
 
@@ -42,10 +42,6 @@ ENTRA_SCOPES: Final[str] = "openid profile email"
 ENTRA_HTTP_TIMEOUT_SECONDS: Final[float] = 10.0
 ENTRA_ID_TOKEN_ALGORITHMS: Final[tuple[str, ...]] = ("RS256",)
 ENTRA_CLOCK_SKEW_SECONDS: Final[int] = 60
-JWKS_CACHE_TTL_SECONDS: Final[int] = 3600
-# A key id we do not know may mean Entra rotated its keys; refetch, but never
-# more often than this so a flood of bogus ``kid`` values cannot hammer Entra.
-JWKS_REFETCH_MIN_INTERVAL_SECONDS: Final[int] = 30
 
 
 class EntraAuthError(NnMcpAuthError):
@@ -127,10 +123,11 @@ class EntraVerifier:
         self._client_secret = settings.entra_client_secret
         self._issuer = entra_issuer(self._tenant_id)
         self._token_endpoint = entra_token_endpoint(self._tenant_id)
-        self._jwks_uri = entra_jwks_uri(self._tenant_id)
-        self._clock = clock
-        self._keys: dict[str, Any] = {}
-        self._fetched_at: float | None = None
+        self._jwks = JwksCache(
+            entra_jwks_uri(self._tenant_id),
+            clock=clock,
+            failure_event="oauth_entra_jwks_refresh_failed",
+        )
 
     async def exchange_code(self, code: str, *, redirect_uri: str) -> str:
         """Redeem the Entra authorization code; returns the raw ``id_token``."""
@@ -182,7 +179,10 @@ class EntraVerifier:
         if not isinstance(kid, str) or not kid:
             raise EntraAuthError("id_token_kid_missing")
 
-        key = await self._signing_key(kid)
+        try:
+            key = await self._jwks.signing_key(kid)
+        except JwksError as exc:
+            raise EntraAuthError(exc.reason) from exc
         try:
             claims = jwt.decode(
                 id_token,
@@ -219,64 +219,6 @@ class EntraVerifier:
             upn=upn.strip().lower() if isinstance(upn, str) and upn.strip() else None,
             name=name if isinstance(name, str) and name else None,
         )
-
-    async def _signing_key(self, kid: str) -> Any:
-        now = self._clock()
-        never_fetched = self._fetched_at is None
-        stale = never_fetched or now - float(self._fetched_at or 0.0) > JWKS_CACHE_TTL_SECONDS
-        can_refetch = (
-            never_fetched
-            or now - float(self._fetched_at or 0.0) >= JWKS_REFETCH_MIN_INTERVAL_SECONDS
-        )
-        if (stale or kid not in self._keys) and can_refetch:
-            await self._fetch_jwks()
-        key = self._keys.get(kid)
-        if key is None:
-            raise EntraAuthError("signing_key_unknown")
-        return key
-
-    async def _fetch_jwks(self) -> None:
-        try:
-            async with httpx.AsyncClient(timeout=ENTRA_HTTP_TIMEOUT_SECONDS) as client:
-                response = await client.get(self._jwks_uri)
-            if response.status_code != 200:
-                raise EntraAuthError("jwks_unavailable")
-            data = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            if self._keys:
-                # Keep serving the cached keys: Entra rotates rarely and a
-                # transient outage must not lock every login out.
-                log_json(LOGGER, logging.WARNING, "oauth_entra_jwks_refresh_failed")
-                self._fetched_at = self._clock()
-                return
-            raise EntraAuthError("jwks_unreachable") from exc
-        except EntraAuthError:
-            if self._keys:
-                log_json(LOGGER, logging.WARNING, "oauth_entra_jwks_refresh_failed")
-                self._fetched_at = self._clock()
-                return
-            raise
-
-        keys: dict[str, Any] = {}
-        raw_keys = data.get("keys") if isinstance(data, dict) else None
-        for jwk_data in raw_keys if isinstance(raw_keys, list) else []:
-            if not isinstance(jwk_data, dict) or jwk_data.get("kty") != "RSA":
-                continue
-            key_id = jwk_data.get("kid")
-            if not isinstance(key_id, str) or not key_id:
-                continue
-            try:
-                keys[key_id] = PyJWK.from_dict(jwk_data, algorithm="RS256").key
-            except jwt.PyJWTError:
-                continue
-        if not keys:
-            if self._keys:
-                log_json(LOGGER, logging.WARNING, "oauth_entra_jwks_refresh_failed")
-                self._fetched_at = self._clock()
-                return
-            raise EntraAuthError("jwks_empty")
-        self._keys = keys
-        self._fetched_at = self._clock()
 
 
 def _error_code(response: httpx.Response) -> str | None:

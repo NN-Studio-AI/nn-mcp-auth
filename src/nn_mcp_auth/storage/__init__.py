@@ -9,6 +9,7 @@ from .base import (
     OAuthStores,
     PendingAuthorizationStore,
     RefreshTokenStore,
+    ReplayGuardStore,
 )
 from .memory import (
     MemoryAccessTokenStore,
@@ -17,6 +18,7 @@ from .memory import (
     MemoryOAuthStores,
     MemoryPendingAuthorizationStore,
     MemoryRefreshTokenStore,
+    MemoryReplayGuard,
 )
 from .redis import (
     RedisAccessTokenStore,
@@ -25,6 +27,7 @@ from .redis import (
     RedisOAuthStores,
     RedisPendingAuthorizationStore,
     RedisRefreshTokenStore,
+    RedisReplayGuard,
 )
 
 __all__ = [
@@ -33,16 +36,19 @@ __all__ = [
     "LoginAttemptLimiter",
     "OAuthStores",
     "PendingAuthorizationStore",
+    "ReplayGuardStore",
     "RefreshTokenStore",
     "MemoryAccessTokenStore",
     "MemoryAuthCodeStore",
     "MemoryLoginAttemptLimiter",
+    "MemoryReplayGuard",
     "MemoryOAuthStores",
     "MemoryPendingAuthorizationStore",
     "MemoryRefreshTokenStore",
     "RedisAccessTokenStore",
     "RedisAuthCodeStore",
     "RedisLoginAttemptLimiter",
+    "RedisReplayGuard",
     "RedisOAuthStores",
     "RedisPendingAuthorizationStore",
     "RedisRefreshTokenStore",

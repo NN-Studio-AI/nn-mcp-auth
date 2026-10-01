@@ -12,6 +12,7 @@ one Redis instance without collisions:
 - ``{prefix}:code:{code}``     → JSON     (TTL = code lifetime)
 - ``{prefix}:pending_authz:{id}`` → JSON  (TTL = pending /authorize lifetime)
 - ``{prefix}:login_attempts:{ip}`` → int  (TTL = rate-limit window)
+- ``{prefix}:assertion_jti:{client|jti}`` → ``"1"`` (TTL = assertion lifetime)
 """
 
 from __future__ import annotations
@@ -45,21 +46,40 @@ REDIS_KEY_PREFIX_ENV_VAR = "REDIS_KEY_PREFIX"
 _ANONYMOUS_VALUE = "1"
 
 
-def _encode_subject(subject: str | None) -> str:
-    if not subject:
+def _encode_token_meta(subject: str | None, client_id: str | None = None) -> str:
+    if not subject and not client_id:
         return _ANONYMOUS_VALUE
-    return json.dumps({"subject": subject}, separators=(",", ":"))
+    meta: dict[str, str] = {}
+    if subject:
+        meta["subject"] = subject
+    if client_id:
+        meta["client_id"] = client_id
+    return json.dumps(meta, separators=(",", ":"))
 
 
-def _decode_subject(raw: str | None) -> str | None:
+def _decode_token_meta(raw: str | None) -> tuple[str | None, str | None]:
     if not raw or not raw.startswith("{"):
-        return None
+        return None, None
     try:
         data = json.loads(raw)
     except ValueError:
-        return None
-    subject = data.get("subject") if isinstance(data, dict) else None
-    return subject if isinstance(subject, str) and subject else None
+        return None, None
+    if not isinstance(data, dict):
+        return None, None
+    subject = data.get("subject")
+    client_id = data.get("client_id")
+    return (
+        subject if isinstance(subject, str) and subject else None,
+        client_id if isinstance(client_id, str) and client_id else None,
+    )
+
+
+def _encode_subject(subject: str | None) -> str:
+    return _encode_token_meta(subject)
+
+
+def _decode_subject(raw: str | None) -> str | None:
+    return _decode_token_meta(raw)[0]
 
 
 class RedisAccessTokenStore:
@@ -106,9 +126,11 @@ class RedisRefreshTokenStore:
         self._prefix = f"{prefix}:refresh"
         self._ttl = ttl_seconds
 
-    def issue(self, *, subject: str | None = None) -> str:
+    def issue(self, *, subject: str | None = None, client_id: str | None = None) -> str:
         token = secrets.token_urlsafe(64)
-        self._r.set(f"{self._prefix}:{token}", _encode_subject(subject), ex=self._ttl)
+        self._r.set(
+            f"{self._prefix}:{token}", _encode_token_meta(subject, client_id), ex=self._ttl
+        )
         return token
 
     def consume(self, token: str) -> bool:
@@ -121,7 +143,8 @@ class RedisRefreshTokenStore:
         raw = cast(str | None, self._r.getdel(f"{self._prefix}:{token}"))
         if raw is None:
             return None
-        return RefreshTokenRecord(subject=_decode_subject(raw))
+        subject, client_id = _decode_token_meta(raw)
+        return RefreshTokenRecord(subject=subject, client_id=client_id)
 
 
 class RedisAuthCodeStore:
@@ -258,6 +281,17 @@ class RedisLoginAttemptLimiter:
         return int(count), remaining
 
 
+class RedisReplayGuard:
+    """``SET key 1 NX EX ttl``: atomic single-use claim with native expiry."""
+
+    def __init__(self, client: redis.Redis, *, prefix: str) -> None:
+        self._r = client
+        self._prefix = f"{prefix}:assertion_jti"
+
+    def claim(self, key: str, ttl_seconds: int) -> bool:
+        return bool(self._r.set(f"{self._prefix}:{key}", "1", nx=True, ex=max(1, ttl_seconds)))
+
+
 @dataclass(frozen=True, slots=True)
 class RedisOAuthStores(OAuthStores):
     @classmethod
@@ -307,4 +341,5 @@ class RedisOAuthStores(OAuthStores):
             code=RedisAuthCodeStore(client, prefix=prefix, ttl_seconds=code_ttl),
             pending=RedisPendingAuthorizationStore(client, prefix=prefix),
             login_limiter=RedisLoginAttemptLimiter(client, prefix=prefix),
+            replay_guard=RedisReplayGuard(client, prefix=prefix),
         )

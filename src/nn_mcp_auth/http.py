@@ -6,6 +6,12 @@ mounts the following routes when ``settings.enabled``:
 - ``GET  /authorize``                                  — Authorization Code grant
 - ``POST /authorize``                                  — login form submit (password mode only)
 - ``GET  /oauth/entra/callback``                       — Microsoft Entra ID return (Entra mode only)
+
+Clients may identify themselves with a Client ID Metadata Document URL
+(``client_id=https://chatgpt.com/oauth/client.json``) instead of the
+pre-configured ``OAUTH_CLIENT_ID`` when ``settings.cimd_active`` (a person
+login is configured and the URL's host is in ``OAUTH_CIMD_ALLOWED_HOSTS``);
+see :mod:`nn_mcp_auth.cimd`.
 - ``POST /token``                                      — all three grant types
 - ``POST /oauth/token``                                — legacy alias for /token
 - ``GET  /.well-known/oauth-authorization-server``     — RFC 8414 metadata
@@ -38,12 +44,21 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from urllib.parse import urlencode, urlsplit
 
+import jwt
 from starlette.applications import Starlette
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from .cimd import (
+    CLIENT_ASSERTION_TYPE_JWT_BEARER,
+    ClientMetadata,
+    ClientMetadataError,
+    ClientMetadataResolver,
+    is_client_id_url,
+)
 from .entra import EntraAuthError, EntraVerifier, build_entra_authorize_url
+from .jwks import SUPPORTED_JWS_ALGORITHMS
 from .login_page import (
     MSG_ENTRA_FAILED,
     MSG_ENTRA_NOT_ALLOWED,
@@ -65,8 +80,17 @@ from .oauth import (
 )
 from .password import login_credentials_match
 from .runtime import log_json
-from .storage.base import LoginAttemptLimiter, OAuthStores, PendingAuthorizationStore
-from .storage.memory import MemoryLoginAttemptLimiter, MemoryPendingAuthorizationStore
+from .storage.base import (
+    LoginAttemptLimiter,
+    OAuthStores,
+    PendingAuthorizationStore,
+    ReplayGuardStore,
+)
+from .storage.memory import (
+    MemoryLoginAttemptLimiter,
+    MemoryPendingAuthorizationStore,
+    MemoryReplayGuard,
+)
 
 # Login events are logged here; call ``configure_logging(logger_name="nn_mcp_auth")``
 # in the MCP entrypoint to get them as JSON lines.
@@ -146,6 +170,7 @@ def _issue_token_response(
     *,
     include_refresh: bool,
     subject: str | None = None,
+    client_id: str | None = None,
 ) -> JSONResponse:
     access_token, expires_in = stores.access.issue(subject=subject)
     body: dict[str, Any] = {
@@ -154,17 +179,39 @@ def _issue_token_response(
         "expires_in": expires_in,
     }
     if include_refresh:
-        body["refresh_token"] = stores.refresh.issue(subject=subject)
+        body["refresh_token"] = stores.refresh.issue(subject=subject, client_id=client_id)
     return JSONResponse(
         body,
         headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
     )
 
 
+async def _resolve_cimd_client(
+    resolver: ClientMetadataResolver | None, client_id: str
+) -> ClientMetadata | None:
+    """Metadata for a URL ``client_id``, or ``None`` when it must be rejected (logged)."""
+
+    if resolver is None:
+        log_json(LOGGER, logging.WARNING, "oauth_cimd_rejected", reason="cimd_inactive")
+        return None
+    try:
+        return await resolver.resolve(client_id)
+    except ClientMetadataError as exc:
+        log_json(
+            LOGGER,
+            logging.WARNING,
+            "oauth_cimd_rejected",
+            client_id=client_id[:200],
+            reason=exc.reason,
+        )
+        return None
+
+
 def _make_authorize_handler(
     settings: OAuthSettings,
     stores: OAuthStores,
     pending: PendingAuthorizationStore,
+    resolver: ClientMetadataResolver | None,
 ) -> Callable[[Request], Awaitable[Response]]:
     async def handler(request: Request) -> Response:
         if not settings.enabled:
@@ -181,10 +228,17 @@ def _make_authorize_handler(
         # Validations whose failure must NOT redirect (RFC 6749 §4.1.2.1):
         # bad client_id / bad redirect_uri are surfaced to the user directly
         # so we never bounce a code/error to an attacker-supplied URI.
-        if not client_id or not client_id_matches(client_id, settings):
-            return _oauth_error("invalid_client", status_code=401)
-        if not settings.is_redirect_uri_allowed(redirect_uri):
-            return _oauth_error("invalid_request", status_code=400)
+        if client_id and is_client_id_url(client_id):
+            client_metadata = await _resolve_cimd_client(resolver, client_id)
+            if client_metadata is None:
+                return _oauth_error("invalid_client", status_code=401)
+            if not client_metadata.is_redirect_uri_allowed(redirect_uri):
+                return _oauth_error("invalid_request", status_code=400)
+        else:
+            if not client_id or not client_id_matches(client_id, settings):
+                return _oauth_error("invalid_client", status_code=401)
+            if not settings.is_redirect_uri_allowed(redirect_uri):
+                return _oauth_error("invalid_request", status_code=400)
 
         # RFC 9207 ``iss`` is only added when the login page is on, so the
         # legacy auto-approve redirects stay exactly as they were.
@@ -469,9 +523,60 @@ def _make_entra_callback_handler(
     return handler
 
 
+def _unverified_issuer(assertion: str) -> str:
+    """``iss`` of a client assertion before verification (RFC 7523 lets ``client_id`` be omitted)."""
+
+    try:
+        claims = jwt.decode(assertion, options={"verify_signature": False})
+    except jwt.PyJWTError:
+        return ""
+    iss = claims.get("iss")
+    return iss.strip() if isinstance(iss, str) else ""
+
+
 def _make_token_handler(
-    settings: OAuthSettings, stores: OAuthStores
+    settings: OAuthSettings,
+    stores: OAuthStores,
+    resolver: ClientMetadataResolver | None,
+    replay_guard: ReplayGuardStore,
 ) -> Callable[[Request], Awaitable[Response]]:
+    async def authenticate_cimd_client(
+        request: Request, client_id: str, form: Any
+    ) -> ClientMetadata | Response:
+        """Authenticate a URL client: ``private_key_jwt`` assertion or public ``none``."""
+
+        metadata = await _resolve_cimd_client(resolver, client_id)
+        if metadata is None:
+            return _oauth_error("invalid_client", status_code=401)
+        assertion = _form_value(form.get("client_assertion")).strip()
+        assertion_type = _form_value(form.get("client_assertion_type")).strip()
+        if assertion:
+            if assertion_type != CLIENT_ASSERTION_TYPE_JWT_BEARER or not metadata.allows(
+                "private_key_jwt"
+            ):
+                return _oauth_error("invalid_client", status_code=401)
+            issuer = _issuer(settings, request)
+            try:
+                await resolver.verify_client_assertion(  # type: ignore[union-attr]
+                    assertion,
+                    metadata,
+                    token_endpoint=f"{issuer}/token",
+                    issuer=issuer,
+                    replay_guard=replay_guard,
+                )
+            except ClientMetadataError as exc:
+                log_json(
+                    LOGGER,
+                    logging.WARNING,
+                    "oauth_cimd_assertion_rejected",
+                    client_id=client_id[:200],
+                    reason=exc.reason,
+                )
+                return _oauth_error("invalid_client", status_code=401)
+        elif not metadata.allows("none"):
+            return _oauth_error("invalid_client", status_code=401)
+        return metadata
+
     async def handler(request: Request) -> Response:
         if not settings.enabled:
             return _oauth_error("invalid_client", status_code=503)
@@ -490,12 +595,21 @@ def _make_token_handler(
             provided_id = _form_value(form.get("client_id")).strip()
             provided_secret = _form_value(form.get("client_secret"))
 
+        client_assertion = _form_value(form.get("client_assertion")).strip()
+        if client_assertion and not provided_id:
+            provided_id = _unverified_issuer(client_assertion)
+        is_cimd = bool(provided_id) and is_client_id_url(provided_id)
+
         if grant_type == "authorization_code":
             code = _form_value(form.get("code")).strip()
             redirect_uri = _form_value(form.get("redirect_uri")).strip()
             code_verifier = _form_value(form.get("code_verifier")).strip()
 
-            if not client_id_matches(provided_id, settings):
+            if is_cimd:
+                outcome = await authenticate_cimd_client(request, provided_id, form)
+                if isinstance(outcome, Response):
+                    return outcome
+            elif not client_id_matches(provided_id, settings):
                 return _oauth_error("invalid_client", status_code=401)
             if not code or not redirect_uri or not code_verifier:
                 return _oauth_error("invalid_request")
@@ -512,25 +626,47 @@ def _make_token_handler(
             ):
                 return _oauth_error("invalid_grant")
 
-            return _issue_token_response(stores, include_refresh=True, subject=record.subject)
+            return _issue_token_response(
+                stores,
+                include_refresh=True,
+                subject=record.subject,
+                client_id=record.client_id,
+            )
 
         if grant_type == "refresh_token":
             refresh_token = _form_value(form.get("refresh_token")).strip()
-            if not client_id_matches(provided_id, settings):
+            if is_cimd:
+                outcome = await authenticate_cimd_client(request, provided_id, form)
+                if isinstance(outcome, Response):
+                    return outcome
+            elif not client_id_matches(provided_id, settings):
                 return _oauth_error("invalid_client", status_code=401)
             if not refresh_token:
                 return _oauth_error("invalid_request")
             refresh_record = stores.refresh.pop(refresh_token)
             if refresh_record is None:
                 return _oauth_error("invalid_grant")
+            # Refresh tokens are bound to the client they were issued to. Tokens
+            # minted before 0.4.0 carry no client and belong to the static client.
+            if refresh_record.client_id is None:
+                if is_cimd:
+                    return _oauth_error("invalid_grant")
+            elif refresh_record.client_id != provided_id:
+                return _oauth_error("invalid_grant")
             return _issue_token_response(
-                stores, include_refresh=True, subject=refresh_record.subject
+                stores,
+                include_refresh=True,
+                subject=refresh_record.subject,
+                client_id=provided_id,
             )
 
         if grant_type == "client_credentials":
+            if is_cimd:
+                # Metadata-document clients are user-delegated by construction.
+                return _oauth_error("unauthorized_client")
             if not credentials_match(provided_id, provided_secret, settings):
                 return _oauth_error("invalid_client", status_code=401)
-            return _issue_token_response(stores, include_refresh=False)
+            return _issue_token_response(stores, include_refresh=False, client_id=provided_id)
 
         return _oauth_error("unsupported_grant_type")
 
@@ -565,6 +701,17 @@ def _make_metadata_handler(
             # RFC 9207 §3: only advertised when every authorization response
             # really carries ``iss`` (true only in login mode).
             metadata["authorization_response_iss_parameter_supported"] = True
+        if settings.cimd_active:
+            metadata["client_id_metadata_document_supported"] = True
+            metadata["token_endpoint_auth_methods_supported"] = [
+                "client_secret_basic",
+                "client_secret_post",
+                "private_key_jwt",
+                "none",
+            ]
+            metadata["token_endpoint_auth_signing_alg_values_supported"] = list(
+                SUPPORTED_JWS_ALGORITHMS
+            )
         return JSONResponse(metadata)
 
     return handler
@@ -608,11 +755,24 @@ def build_oauth_endpoints(
     *,
     settings: OAuthSettings,
     stores: OAuthStores,
+    client_metadata_resolver: ClientMetadataResolver | None = None,
 ) -> Starlette:
-    """Mount the OAuth routes on ``app``. Returns the same app for chaining."""
+    """Mount the OAuth routes on ``app``. Returns the same app for chaining.
+
+    ``client_metadata_resolver`` lets callers (and tests) inject the Client ID
+    Metadata Document resolver; by default one is built from
+    ``settings.cimd_allowed_hosts`` when ``settings.cimd_active``.
+    """
 
     if not settings.enabled:
         return app
+
+    resolver: ClientMetadataResolver | None = None
+    if settings.cimd_active:
+        resolver = client_metadata_resolver or ClientMetadataResolver(
+            allowed_hosts=settings.cimd_allowed_hosts
+        )
+    replay_guard = stores.replay_guard if stores.replay_guard is not None else MemoryReplayGuard()
 
     # Hand-built ``OAuthStores`` may predate the login stores; fall back to
     # in-process versions (fine for a single replica, Redis is preferred).
@@ -623,8 +783,8 @@ def build_oauth_endpoints(
         else MemoryLoginAttemptLimiter()
     )
 
-    authorize_handler = _make_authorize_handler(settings, stores, pending)
-    token_handler = _make_token_handler(settings, stores)
+    authorize_handler = _make_authorize_handler(settings, stores, pending, resolver)
+    token_handler = _make_token_handler(settings, stores, resolver, replay_guard)
     metadata_handler = _make_metadata_handler(settings)
     protected_resource_handler = _make_protected_resource_handler(settings)
 
