@@ -31,6 +31,11 @@ OAUTH_ENTRA_TENANT_ID_ENV_VAR: Final[str] = "OAUTH_ENTRA_TENANT_ID"
 OAUTH_ENTRA_CLIENT_ID_ENV_VAR: Final[str] = "OAUTH_ENTRA_CLIENT_ID"
 OAUTH_ENTRA_CLIENT_SECRET_ENV_VAR: Final[str] = "OAUTH_ENTRA_CLIENT_SECRET"
 OAUTH_ENTRA_ALLOWED_UPNS_ENV_VAR: Final[str] = "OAUTH_ENTRA_ALLOWED_UPNS"
+OAUTH_CIMD_ENABLED_ENV_VAR: Final[str] = "OAUTH_CIMD_ENABLED"
+OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR: Final[str] = "OAUTH_CIMD_ALLOWED_HOSTS"
+
+# Hosts whose Client ID Metadata Documents are trusted by default (plus subdomains).
+DEFAULT_CIMD_ALLOWED_HOSTS: Final[tuple[str, ...]] = ("chatgpt.com", "claude.ai", "claude.com")
 
 # Path (relative to the issuer) that Microsoft Entra ID redirects back to.
 # Register ``{OAUTH_ISSUER_URL}/oauth/entra/callback`` on the app registration.
@@ -76,10 +81,25 @@ class OAuthSettings:
     entra_client_secret: str = field(default="", repr=False)
     # Lower-cased UPNs/e-mails allowed to log in; empty = any user of the tenant.
     entra_allowed_upns: tuple[str, ...] = ()
+    # Client ID Metadata Documents (clients identified by an HTTPS URL, e.g. ChatGPT).
+    cimd_enabled: bool = True
+    cimd_allowed_hosts: tuple[str, ...] = DEFAULT_CIMD_ALLOWED_HOSTS
 
     @property
     def enabled(self) -> bool:
         return bool(self.client_id) and bool(self.client_secret)
+
+    @property
+    def cimd_active(self) -> bool:
+        """CIMD only works on top of a person login: an auto-approving server
+        would otherwise hand tokens to any client that knows its URL."""
+
+        return (
+            self.enabled
+            and self.cimd_enabled
+            and bool(self.cimd_allowed_hosts)
+            and self.login_enabled
+        )
 
     @property
     def entra_enabled(self) -> bool:
@@ -167,9 +187,15 @@ class AuthorizationCodeRecord:
 
 @dataclass(frozen=True, slots=True)
 class RefreshTokenRecord:
-    """What a consumed refresh token carried: the subject to re-attach to the new tokens."""
+    """What a consumed refresh token carried.
+
+    ``subject`` is re-attached to the new tokens; ``client_id`` binds the token
+    to the OAuth client it was issued to (``None`` for tokens minted before
+    0.4.0, which belong to the pre-configured client).
+    """
 
     subject: str | None = None
+    client_id: str | None = None
 
 
 def verify_pkce(code_verifier: str, code_challenge: str, method: str) -> bool:
@@ -251,6 +277,7 @@ def load_oauth_settings(env: Mapping[str, str] | None = None) -> OAuthSettings:
     entra_tenant_id, entra_client_id, entra_client_secret, entra_allowed_upns = (
         _load_entra_settings(env)
     )
+    cimd_enabled, cimd_allowed_hosts = _load_cimd_settings(env)
 
     return OAuthSettings(
         client_id=client_id,
@@ -264,7 +291,43 @@ def load_oauth_settings(env: Mapping[str, str] | None = None) -> OAuthSettings:
         entra_client_id=entra_client_id,
         entra_client_secret=entra_client_secret,
         entra_allowed_upns=entra_allowed_upns,
+        cimd_enabled=cimd_enabled,
+        cimd_allowed_hosts=cimd_allowed_hosts,
     )
+
+
+def _load_cimd_settings(env: Mapping[str, str]) -> tuple[bool, tuple[str, ...]]:
+    """``OAUTH_CIMD_ENABLED`` (default true) and ``OAUTH_CIMD_ALLOWED_HOSTS`` (CSV)."""
+
+    raw_enabled = env.get(OAUTH_CIMD_ENABLED_ENV_VAR, "").strip().lower()
+    if raw_enabled in ("", "true", "1", "yes"):
+        enabled = True
+    elif raw_enabled in ("false", "0", "no"):
+        enabled = False
+    else:
+        raise ConfigurationError(
+            f"{OAUTH_CIMD_ENABLED_ENV_VAR} must be true or false",
+            details={OAUTH_CIMD_ENABLED_ENV_VAR: raw_enabled},
+        )
+
+    raw_hosts = env.get(OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR, "").strip()
+    if not raw_hosts:
+        return enabled, DEFAULT_CIMD_ALLOWED_HOSTS
+    hosts = tuple(dict.fromkeys(h.strip().lower() for h in raw_hosts.split(",") if h.strip()))
+    if not hosts:
+        raise ConfigurationError(
+            f"{OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR} must be a comma-separated list of hostnames, "
+            "or unset to use the defaults.",
+            details={OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR: raw_hosts},
+        )
+    for host in hosts:
+        if "/" in host or ":" in host or host.startswith("."):
+            raise ConfigurationError(
+                f"{OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR} entries must be bare hostnames "
+                "(e.g. chatgpt.com), without scheme, port or path.",
+                details={OAUTH_CIMD_ALLOWED_HOSTS_ENV_VAR: host},
+            )
+    return enabled, hosts
 
 
 def _load_entra_settings(env: Mapping[str, str]) -> tuple[str, str, str, tuple[str, ...]]:

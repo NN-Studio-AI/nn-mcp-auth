@@ -59,13 +59,17 @@ class MemoryAccessTokenStore:
 @dataclass(slots=True)
 class MemoryRefreshTokenStore:
     ttl_seconds: int = REFRESH_TOKEN_TTL_SECONDS
-    # token -> (expires_at, subject)
-    _tokens: dict[str, tuple[float, str | None]] = field(default_factory=dict)
+    # token -> (expires_at, subject, client_id)
+    _tokens: dict[str, tuple[float, str | None, str | None]] = field(default_factory=dict)
     _clock: Callable[[], float] = field(default=time.monotonic)
 
-    def issue(self, *, subject: str | None = None) -> str:
+    def issue(self, *, subject: str | None = None, client_id: str | None = None) -> str:
         token = secrets.token_urlsafe(64)
-        self._tokens[token] = (self._clock() + self.ttl_seconds, subject or None)
+        self._tokens[token] = (
+            self._clock() + self.ttl_seconds,
+            subject or None,
+            client_id or None,
+        )
         self._purge_expired()
         return token
 
@@ -77,16 +81,34 @@ class MemoryRefreshTokenStore:
         stored = self._tokens.pop(token, None)
         if stored is None:
             return None
-        expires_at, subject = stored
+        expires_at, subject, client_id = stored
         if expires_at <= self._clock():
             return None
-        return RefreshTokenRecord(subject=subject)
+        return RefreshTokenRecord(subject=subject, client_id=client_id)
 
     def _purge_expired(self) -> None:
         now = self._clock()
-        expired = [t for t, (exp, _) in self._tokens.items() if exp <= now]
+        expired = [t for t, (exp, _, _) in self._tokens.items() if exp <= now]
         for t in expired:
             del self._tokens[t]
+
+
+@dataclass(slots=True)
+class MemoryReplayGuard:
+    """Single-use keys (``jti`` of client assertions) with per-key expiry."""
+
+    _seen: dict[str, float] = field(default_factory=dict)
+    _clock: Callable[[], float] = field(default=time.monotonic)
+
+    def claim(self, key: str, ttl_seconds: int) -> bool:
+        now = self._clock()
+        expired = [k for k, exp in self._seen.items() if exp <= now]
+        for k in expired:
+            del self._seen[k]
+        if key in self._seen:
+            return False
+        self._seen[key] = now + max(1, ttl_seconds)
+        return True
 
 
 @dataclass(slots=True)
@@ -212,4 +234,5 @@ class MemoryOAuthStores(OAuthStores):
             code=MemoryAuthCodeStore(ttl_seconds=code_ttl),
             pending=MemoryPendingAuthorizationStore(ttl_seconds=pending_ttl),
             login_limiter=MemoryLoginAttemptLimiter(window_seconds=login_window),
+            replay_guard=MemoryReplayGuard(),
         )

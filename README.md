@@ -59,6 +59,8 @@ That replaces the entire `auth.py` + `oauth.py` + most of `http_app.py` that use
 | `OAUTH_ENTRA_CLIENT_ID` | Application (client) ID of the app registration | — |
 | `OAUTH_ENTRA_CLIENT_SECRET` | Client secret of the app registration | — |
 | `OAUTH_ENTRA_ALLOWED_UPNS` | CSV of e-mails/UPNs allowed to log in | — (any user of the tenant) |
+| `OAUTH_CIMD_ENABLED` | Accept clients identified by a Client ID Metadata Document URL (see [Clientes por Client ID Metadata Document](#clientes-por-client-id-metadata-document)); only effective when a person login is configured | `true` |
+| `OAUTH_CIMD_ALLOWED_HOSTS` | CSV of hosts (plus subdomains) whose metadata documents are trusted | `chatgpt.com,claude.ai,claude.com` |
 | `REDIS_URL` | `redis://host:port[/db]` | required for `RedisOAuthStores.from_env()` |
 | `REDIS_KEY_PREFIX` | Namespace per MCP, e.g. `mcp:whatsapp` | required |
 | `LOG_LEVEL` | Stdlib log level for `configure_logging()` | INFO |
@@ -69,6 +71,47 @@ Default `OAUTH_ALLOWED_REDIRECT_URIS` (used when the var is unset):
 - `https://claude.com/api/mcp/auth_callback`
 - `https://chatgpt.com/connector_platform_oauth_redirect`
 - `https://chat.openai.com/connector_platform_oauth_redirect`
+
+## Clientes por Client ID Metadata Document
+
+A partir da 0.4.0 um cliente não precisa de `OAUTH_CLIENT_ID`/`OAUTH_CLIENT_SECRET`
+pré-combinados: ele pode se identificar com uma URL HTTPS que serve o seu
+documento de metadados ([draft-ietf-oauth-client-id-metadata-document](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-client-id-metadata-document),
+mecanismo padrão da especificação MCP 2026-07-28). É o que o ChatGPT faz com
+`client_id=https://chatgpt.com/oauth/client.json`: na hora de conectar o
+conector, a pessoa só faz o login e pronto.
+
+Como funciona:
+
+1. A metadata RFC 8414 anuncia `client_id_metadata_document_supported: true`,
+   `token_endpoint_auth_methods_supported` com `private_key_jwt` e `none` e
+   `token_endpoint_auth_signing_alg_values_supported`.
+2. `GET /authorize` com `client_id` em forma de URL: a URL precisa ser `https`,
+   ter caminho, não ter userinfo, fragmento nem segmentos `.`/`..`, não ser IP
+   nem `localhost`, e o host precisa estar em `OAUTH_CIMD_ALLOWED_HOSTS` (ou ser
+   subdomínio de um deles) e resolver para endereços públicos. Só então o
+   documento é buscado (sem seguir redirects, no máximo 16 KiB) e validado:
+   `client_id` igual à URL, `redirect_uris` contendo o `redirect_uri` pedido,
+   nenhum segredo embutido, método de autenticação `none` ou `private_key_jwt`
+   (com `jwks_uri` no mesmo domínio confiável ou `jwks` embutido). O documento
+   fica em cache respeitando `Cache-Control: max-age` (entre 60 s e 24 h).
+3. A pessoa faz o login (Entra ou senha) como em qualquer cliente.
+4. `POST /token`: com `client_assertion` (`private_key_jwt`, o que o ChatGPT
+   prefere), a assinatura é verificada pela chave do documento e os claims
+   `iss`/`sub` = `client_id`, `aud` = token endpoint ou issuer, `exp` (até 10
+   minutos) e `jti` de uso único (guardado no Redis/memória) são conferidos. Sem
+   assertion, o cliente precisa permitir `none` no documento (PKCE obrigatório).
+5. Os refresh tokens ficam presos ao cliente que os recebeu: um refresh emitido
+   ao ChatGPT não serve ao cliente pré-configurado e vice-versa.
+   `client_credentials` continua exclusivo do cliente pré-configurado.
+
+Regra de segurança: CIMD só fica ativo quando existe login de pessoa
+(`OAUTH_ENTRA_*` ou `OAUTH_LOGIN_*`). Num MCP em aprovação automática ele é
+ignorado e não é anunciado, porque qualquer cliente que soubesse a URL do
+servidor ganharia tokens. `OAUTH_CIMD_ENABLED=false` desliga de vez.
+
+Logs: `oauth_cimd_document_loaded`, `oauth_cimd_rejected` (com `reason`) e
+`oauth_cimd_assertion_rejected`.
 
 ## Login com Microsoft Entra ID
 

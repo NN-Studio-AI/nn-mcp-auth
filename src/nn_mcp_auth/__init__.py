@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 from .auth import BearerAuthMiddleware, get_subject
+from .cimd import (
+    ClientMetadata,
+    ClientMetadataError,
+    ClientMetadataResolver,
+    is_client_id_url,
+    validate_client_id_url,
+)
 from .entra import EntraAuthError, EntraIdentity, EntraVerifier, build_entra_authorize_url
 from .errors import ConfigurationError, NnMcpAuthError, ValidationError
 from .http import build_oauth_endpoints
@@ -30,6 +37,7 @@ from .storage import (
     MemoryOAuthStores,
     MemoryPendingAuthorizationStore,
     MemoryRefreshTokenStore,
+    MemoryReplayGuard,
     OAuthStores,
     PendingAuthorizationStore,
     RedisAccessTokenStore,
@@ -38,16 +46,24 @@ from .storage import (
     RedisOAuthStores,
     RedisPendingAuthorizationStore,
     RedisRefreshTokenStore,
+    RedisReplayGuard,
     RefreshTokenStore,
+    ReplayGuardStore,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
     # auth
     "BearerAuthMiddleware",
     "get_subject",
+    # cimd
+    "ClientMetadata",
+    "ClientMetadataError",
+    "ClientMetadataResolver",
+    "is_client_id_url",
+    "validate_client_id_url",
     # entra
     "EntraAuthError",
     "EntraIdentity",
@@ -86,14 +102,17 @@ __all__ = [
     "MemoryAccessTokenStore",
     "MemoryAuthCodeStore",
     "MemoryLoginAttemptLimiter",
+    "MemoryReplayGuard",
     "MemoryOAuthStores",
     "MemoryPendingAuthorizationStore",
     "MemoryRefreshTokenStore",
     "OAuthStores",
     "PendingAuthorizationStore",
+    "ReplayGuardStore",
     "RedisAccessTokenStore",
     "RedisAuthCodeStore",
     "RedisLoginAttemptLimiter",
+    "RedisReplayGuard",
     "RedisOAuthStores",
     "RedisPendingAuthorizationStore",
     "RedisRefreshTokenStore",

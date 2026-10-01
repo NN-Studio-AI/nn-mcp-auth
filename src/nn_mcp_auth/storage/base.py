@@ -40,8 +40,8 @@ class AccessTokenStore(Protocol):
 
 @runtime_checkable
 class RefreshTokenStore(Protocol):
-    def issue(self, *, subject: str | None = None) -> str:
-        """Mint a refresh token carrying ``subject`` (see :class:`AccessTokenStore.issue`)."""
+    def issue(self, *, subject: str | None = None, client_id: str | None = None) -> str:
+        """Mint a refresh token carrying ``subject`` and the ``client_id`` it belongs to."""
 
     def consume(self, token: str) -> bool:
         """Return ``True`` if the token is valid; invalidates it on success."""
@@ -80,6 +80,12 @@ class PendingAuthorizationStore(Protocol):
 
 
 @runtime_checkable
+class ReplayGuardStore(Protocol):
+    def claim(self, key: str, ttl_seconds: int) -> bool:
+        """Record ``key`` for ``ttl_seconds``; ``False`` when it was already recorded."""
+
+
+@runtime_checkable
 class LoginAttemptLimiter(Protocol):
     def hit(self, key: str) -> tuple[int, int]:
         """Count one attempt for ``key`` in a fixed window.
@@ -95,3 +101,4 @@ class OAuthStores:
     code: AuthCodeStore
     pending: PendingAuthorizationStore | None = None
     login_limiter: LoginAttemptLimiter | None = None
+    replay_guard: ReplayGuardStore | None = None
