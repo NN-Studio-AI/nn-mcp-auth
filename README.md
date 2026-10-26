@@ -91,7 +91,9 @@ Como funciona:
    nem `localhost`, e o host precisa estar em `OAUTH_CIMD_ALLOWED_HOSTS` (ou ser
    subdomínio de um deles) e resolver para endereços públicos. Só então o
    documento é buscado (sem seguir redirects, no máximo 16 KiB) e validado:
-   `client_id` igual à URL, `redirect_uris` contendo o `redirect_uri` pedido,
+   `client_id` igual à URL, `redirect_uris` contendo o `redirect_uri` pedido (para `http` em loopback —
+   `localhost`, `127.0.0.1`, `::1` — qualquer porta vale, RFC 8252 §7.3: é o que
+   o Claude Code usa, com `http://localhost/callback` e porta aleatória),
    nenhum segredo embutido, método de autenticação `none` ou `private_key_jwt`
    (com `jwks_uri` no mesmo domínio confiável ou `jwks` embutido). O documento
    fica em cache respeitando `Cache-Control: max-age` (entre 60 s e 24 h).
