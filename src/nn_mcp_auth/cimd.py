@@ -13,6 +13,8 @@ Security posture of this implementation:
 - the URL must be ``https`` with a path, no userinfo/fragment/dot segments,
   no IP literal nor ``localhost``, and must resolve to public addresses;
 - redirects are never followed and documents are capped in size;
+- redirect URIs must match the document exactly, except loopback ``http``
+  URIs, which match on any port (RFC 8252 §7.3);
 - ``private_key_jwt`` assertions are verified against the document's keys with
   issuer, subject, audience, lifetime and single-use ``jti`` checks;
 - the endpoint factory only enables CIMD when a person login (Entra or
@@ -55,6 +57,7 @@ CLIENT_ASSERTION_MAX_LIFETIME_SECONDS: Final[int] = 600
 CLIENT_ASSERTION_CLOCK_SKEW_SECONDS: Final[int] = 60
 
 _MAX_AGE_RE: Final[re.Pattern[str]] = re.compile(r"(?:^|[,\s])max-age=(\d+)", re.IGNORECASE)
+_LOOPBACK_HOSTS: Final[frozenset[str]] = frozenset({"localhost", "127.0.0.1", "::1"})
 _HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(
     r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$"
 )
@@ -90,7 +93,38 @@ class ClientMetadata:
         return method in self.auth_methods
 
     def is_redirect_uri_allowed(self, redirect_uri: str) -> bool:
-        return bool(redirect_uri) and redirect_uri in self.redirect_uris
+        if not redirect_uri:
+            return False
+        if redirect_uri in self.redirect_uris:
+            return True
+        return any(
+            _loopback_port_match(registered, redirect_uri) for registered in self.redirect_uris
+        )
+
+
+def _loopback_port_match(registered: str, requested: str) -> bool:
+    """RFC 8252 §7.3: a loopback redirect URI matches on any port.
+
+    Native clients (e.g. Claude Code, ``http://localhost/callback``) listen on an
+    ephemeral port chosen per login. Everything but the port must still match:
+    ``http`` scheme, the same loopback host, path and query, and no userinfo or
+    fragment in the requested URI.
+    """
+
+    if "#" in requested:
+        return False
+    reg, req = urlsplit(registered), urlsplit(requested)
+    if reg.scheme != "http" or req.scheme != "http":
+        return False
+    if reg.hostname not in _LOOPBACK_HOSTS or req.hostname != reg.hostname:
+        return False
+    if req.username is not None or req.password is not None:
+        return False
+    try:
+        req.port  # noqa: B018 - raises ValueError on a malformed or out-of-range port
+    except ValueError:
+        return False
+    return (req.path, req.query) == (reg.path, reg.query)
 
 
 def is_client_id_url(value: str) -> bool:

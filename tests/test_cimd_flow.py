@@ -748,3 +748,104 @@ def test_parse_document_defaults() -> None:
     assert metadata.client_name == "chatgpt.com"
     assert metadata.is_redirect_uri_allowed(CHATGPT_REDIRECT)
     assert not metadata.is_redirect_uri_allowed("")
+
+
+# --------------------------------------------------------------------------- #
+# Loopback redirect URIs (RFC 8252 §7.3) — native clients such as Claude Code
+# --------------------------------------------------------------------------- #
+
+CLAUDE_CODE_CLIENT = "https://claude.ai/oauth/claude-code-client-metadata"
+
+
+def _claude_code_document() -> dict[str, Any]:
+    """The document Claude Code really serves (fetched 2026-10-26)."""
+
+    return {
+        "client_id": CLAUDE_CODE_CLIENT,
+        "client_name": "Claude Code",
+        "client_uri": "https://claude.ai",
+        "redirect_uris": ["http://localhost/callback", "http://127.0.0.1/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+
+@pytest.mark.parametrize(
+    ("redirect_uri", "allowed"),
+    [
+        ("http://localhost/callback", True),
+        ("http://localhost:54680/callback", True),
+        ("http://127.0.0.1:1/callback", True),
+        ("http://LOCALHOST:8765/callback", True),
+        ("https://localhost:54680/callback", False),
+        ("http://localhost:54680/other", False),
+        ("http://localhost:54680/callback?x=1", False),
+        ("http://localhost:54680/callback#frag", False),
+        ("http://user@localhost:54680/callback", False),
+        ("http://localhost:99999/callback", False),
+        ("http://localhost:abc/callback", False),
+        ("http://[::1]:54680/callback", False),
+        ("http://127.0.0.1.evil.com:54680/callback", False),
+        ("http://localhost.evil.com:54680/callback", False),
+        ("http://evil.com:54680/callback", False),
+    ],
+)
+def test_loopback_redirect_uris_match_on_any_port(redirect_uri: str, allowed: bool) -> None:
+    metadata = parse_client_metadata(CLAUDE_CODE_CLIENT, _claude_code_document())
+    assert metadata.is_redirect_uri_allowed(redirect_uri) is allowed
+
+
+def test_port_flexibility_is_only_for_loopback() -> None:
+    document = _chatgpt_document(redirect_uris=["http://example.com/callback"])
+    metadata = parse_client_metadata(CHATGPT_CLIENT, document)
+    assert metadata.is_redirect_uri_allowed("http://example.com/callback")
+    assert not metadata.is_redirect_uri_allowed("http://example.com:8080/callback")
+
+
+@respx.mock
+def test_claude_code_flow_with_ephemeral_loopback_port(stores: OAuthStores) -> None:
+    respx.get(CLAUDE_CODE_CLIENT).mock(
+        return_value=httpx.Response(200, json=_claude_code_document())
+    )
+    resolver = ClientMetadataResolver(allowed_hosts=("claude.ai",), host_resolver=_public_resolver)
+    settings = _settings(cimd_allowed_hosts=("claude.ai",))
+    redirect_uri = "http://localhost:54680/callback"
+    with TestClient(_build_app(settings, stores, resolver)) as client:
+        verifier, challenge = _pkce_pair()
+        resp = _authorize(
+            client, challenge, client_id=CLAUDE_CODE_CLIENT, redirect_uri=redirect_uri
+        )
+        assert resp.status_code == 200, resp.text
+        code = _login(client, resp.text)
+
+        token = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CLAUDE_CODE_CLIENT,
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "code_verifier": verifier,
+            },
+        )
+        assert token.status_code == 200, token.text
+        assert _whoami(client, token.json()["access_token"]) == "caio"
+
+        # The code is bound to the exact port it was issued for.
+        verifier, challenge = _pkce_pair()
+        resp = _authorize(
+            client, challenge, client_id=CLAUDE_CODE_CLIENT, redirect_uri=redirect_uri
+        )
+        code = _login(client, resp.text)
+        other_port = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": CLAUDE_CODE_CLIENT,
+                "code": code,
+                "redirect_uri": "http://localhost:1/callback",
+                "code_verifier": verifier,
+            },
+        )
+        assert other_port.status_code == 400
